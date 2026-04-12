@@ -11,11 +11,12 @@ def test_pyproject_uses_python312_colab_dependency_stack():
     dependencies = pyproject["project"]["dependencies"]
 
     assert pyproject["project"]["requires-python"] == ">=3.10,<3.13"
-    assert "vllm==0.6.5" in dependencies
-    assert "torch==2.5.1" in dependencies
-    assert "torchaudio==2.5.1" in dependencies
-    assert "transformers==4.48.2" in dependencies
-    assert "numpy>=1.26.0,<2.0" in dependencies
+    assert "vllm==0.19.0" in dependencies
+    assert "torch==2.10.0" in dependencies
+    assert "torchaudio==2.10.0" in dependencies
+    assert "transformers>=4.56.0,<5" in dependencies
+    assert "numpy>=1.26.0" in dependencies
+    assert "numpy>=1.26.0,<2.0" not in dependencies
 
 
 def test_openai_server_console_script_uses_hyphenated_name():
@@ -41,4 +42,10 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
 
     assert 'device="cuda"' in xtts_source
     assert "MultiModalInputs" not in mm_source
-    assert "from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs" in mm_source
+    assert "INPUT_REGISTRY" not in mm_source
+    assert "register_input_mapper" not in mm_source
+    assert "register_max_multimodal_tokens" not in mm_source
+    assert "@MULTIMODAL_REGISTRY.register_processor" in mm_source
+    assert "XttsMultiModalProcessor" in mm_source
+    assert "XttsProcessingInfo" in mm_source
+    assert "XttsDummyInputsBuilder" in mm_source

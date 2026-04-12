@@ -25,7 +25,7 @@ Auralis is a text-to-speech engine that makes voice generation practical for rea
 
 # Установка
 ```bash
-pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.10.0 torchaudio==2.10.0
 pip install auralis
 ```
 

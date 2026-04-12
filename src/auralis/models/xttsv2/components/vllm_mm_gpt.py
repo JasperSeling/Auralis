@@ -1,21 +1,20 @@
 import functools
 import random
-from array import array
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from typing import Optional, Union, Iterable, Tuple, Mapping
+from typing import Any, Optional, Union, Iterable, Tuple, Mapping
 
-from networkx.algorithms.clique import enumerate_all_cliques
 from torch import Tensor
 from transformers import GPT2Config
-from triton.language import dtype
+from transformers.feature_extraction_utils import BatchFeature
 
 from vllm.attention import AttentionMetadata
-from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
-from vllm.inputs import InputContext, INPUT_REGISTRY, DecoderOnlyInputs, token_inputs, DummyData
+from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
@@ -24,16 +23,26 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.gpt2 import GPT2Block
 from vllm.model_executor.models.utils import make_layers, make_empty_intermediate_tensors_factory
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
-from vllm.multimodal.inputs import PlaceholderRange
-from vllm.multimodal.utils import consecutive_placeholder_ranges
-from vllm.sequence import IntermediateTensors, SequenceData, VLLM_TOKEN_ID_ARRAY_TYPE
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems, PlaceholderRange
+from vllm.multimodal.parse import (
+    DictEmbeddingItems,
+    ModalityDataItems,
+    MultiModalDataItems,
+    MultiModalDataParser,
+)
+from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    ProcessorInputs,
+    TimingContext,
+)
+from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 
 from typing import Dict, List
 from collections import defaultdict
-
-from vllm.utils import is_list_of
 
 PrefillLength= Union[int, List[int]]
 TokenPosition= Union[int, List[int]]
@@ -215,129 +224,168 @@ class LearnedPositionEmbeddings(nn.Module):
 
 
 
-def get_xtts_max_audio_tokens(ctx: InputContext) -> int:
-    """Calculate maximum audio tokens based on text context and audio duration."""
-    return 32 # the conditoning perciever output
+def _as_batched_xtts_tensor(value: Any, *, dtype: torch.dtype, batch_size: int) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.to(dtype=dtype)
+    else:
+        tensor = torch.tensor(value, dtype=dtype)
+
+    if tensor.ndim == 0:
+        tensor = tensor.unsqueeze(0)
+    if tensor.numel() == 1 and batch_size > 1:
+        tensor = tensor.expand(batch_size)
+    return tensor
 
 
-def dummy_seq_data_for_xtts(
-        ctx: InputContext,
-        seq_len: int,
-        audio_count: int,
-):
-    """Create dummy sequence data for XTTS profiling."""
-    # Calculate audio token space needed
-    conditioning_lenght = (32 # the conditioning perceiver output length in the sql (which is fixed)
-                           +
-                           1) # the start audio token
+def _normalize_xtts_audio_data(data: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+    embeds = data.get("cond_latents", data.get("embeds"))
+    if embeds is None:
+        raise ValueError("Missing XTTS audio conditioning embeddings")
+    if not isinstance(embeds, torch.Tensor):
+        raise TypeError(f"Expected XTTS audio embeddings to be a tensor, got {type(embeds)!r}")
+    if embeds.ndim == 2:
+        embeds = embeds.unsqueeze(0)
+    batch_size = embeds.shape[0]
 
-    return SequenceData.from_prompt_token_counts(
-        (1, conditioning_lenght * audio_count),
-        (0, seq_len - conditioning_lenght * audio_count)),{
-        "audio":
-            consecutive_placeholder_ranges(num_items=audio_count,
-                                           item_size=conditioning_lenght)
-    }
-
-
-def dummy_conditioning_for_xtts(
-        ctx: InputContext,
-        seq_len: int,
-        audio_count: int,
-) -> dict:
-    """Create dummy conditioning data for XTTS."""
     return {
-        "audio": {
-            "embeds":[
-                torch.zeros(
-                    (seq_len, ctx.model_config.hf_config.hidden_size),
-                    dtype=ctx.model_config.dtype) for _ in range(audio_count)
-            ],
-            "is_logits_only_mode": False,
-            "sequence_length": -1,
-        }
+        "cond_latents": embeds,
+        "is_logits_only_mode": _as_batched_xtts_tensor(
+            data.get("is_logits_only_mode", False),
+            dtype=torch.bool,
+            batch_size=batch_size,
+        ),
+        "sequence_length": _as_batched_xtts_tensor(
+            data.get("sequence_length", -1),
+            dtype=torch.long,
+            batch_size=batch_size,
+        ),
     }
 
 
-def dummy_data_for_xtts(
-        ctx: InputContext,
+def _xtts_field_config(hf_inputs: Mapping[str, torch.Tensor]) -> Mapping[str, MultiModalFieldConfig]:
+    return {
+        "cond_latents": MultiModalFieldConfig.batched("audio"),
+        "is_logits_only_mode": MultiModalFieldConfig.batched("audio"),
+        "sequence_length": MultiModalFieldConfig.batched("audio"),
+    }
+
+
+class XttsMultiModalDataParser(MultiModalDataParser):
+    def _parse_audio_data(
+        self,
+        data: Any,
+    ) -> ModalityDataItems[Any, Any] | None:
+        if isinstance(data, Mapping):
+            normalized_data = _normalize_xtts_audio_data(data)
+            return DictEmbeddingItems(
+                normalized_data,
+                modality="audio",
+                required_fields={"cond_latents"},
+                fields_factory=_xtts_field_config,
+            )
+
+        return super()._parse_audio_data(data)
+
+
+class XttsProcessingInfo(BaseProcessingInfo):
+    def get_data_parser(self):
+        return XttsMultiModalDataParser(
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"audio": 1}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int] | None = None,
+    ) -> Mapping[str, int]:
+        return {"audio": 32} if (mm_counts or {}).get("audio", 0) > 0 else {}
+
+
+class XttsDummyInputsBuilder(BaseDummyInputsBuilder[XttsProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        return ""
+
+    def get_dummy_mm_data(
+        self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-):
-    """Create complete dummy data for XTTS profiling."""
-    audio_count = mm_counts["audio"]
-    seq_data, ranges = dummy_seq_data_for_xtts(ctx, seq_len, audio_count)
-    cond_data = dummy_conditioning_for_xtts(ctx, seq_len, audio_count)
-    return DummyData(seq_data, cond_data, ranges)
+        mm_options: Mapping[str, BaseDummyOptions],
+    ) -> MultiModalDataDict:
+        audio_count = mm_counts.get("audio", 0)
+        if audio_count <= 0:
+            return {}
 
-
-def input_mapper_for_xtts(ctx: InputContext, data: Union[Dict, List[Tensor]]) -> MultiModalKwargs:
-    """Map input data to XTTS format."""
-
-    if not isinstance(data, list):
-        data = [data]
-
-    if len(data) == 0:
-        return MultiModalKwargs()
-
-    assert is_list_of(data, dict, check="all"), (f"Expected a list of dictionaries, "
-                                                 f"but got a list of {[type(dat) for dat in data if type(dat) != dict][0]}")
-
-    embeds = [dat["embeds"] for dat in data]
-    is_logits_only_mode = [dat.get("is_logits_only_mode", False) for dat in data]
-    sequence_length = [dat.get("sequence_length", -1) for dat in data]
-    return MultiModalKwargs(
-        {
-            "cond_latents": embeds,
-            "is_logits_only_mode": is_logits_only_mode,
-            "sequence_length": sequence_length
+        hidden_size = self.info.get_hf_config().hidden_size
+        dtype = self.info.ctx.model_config.dtype
+        return {
+            "audio": {
+                "embeds": torch.zeros((32, hidden_size), dtype=dtype),
+                "is_logits_only_mode": False,
+                "sequence_length": -1,
+            }
         }
-    )
 
 
+class XttsMultiModalProcessor(BaseMultiModalProcessor[XttsProcessingInfo]):
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return _xtts_field_config(hf_inputs)
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ):
+        return []
+
+    def apply(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput:
+        prompt_token_ids = inputs.prompt
+        if isinstance(prompt_token_ids, str):
+            tokenizer = self.info.get_tokenizer()
+            prompt_token_ids = tokenizer.encode(prompt_token_ids, add_special_tokens=False)
+
+        audio_items = inputs.mm_data_items.get_items("audio", DictEmbeddingItems)
+        audio_data = audio_items.get_passthrough_data()
+        mm_kwargs = MultiModalKwargsItems.from_hf_inputs(
+            BatchFeature(dict(audio_data)),
+            _xtts_field_config(audio_data),
+        )
+
+        audio = audio_items.get(0)
+        cond_latents = audio["cond_latents"]
+        is_last_decoding_pass = bool(audio["is_logits_only_mode"].item())
+
+        if not is_last_decoding_pass:
+            new_token_ids = ([1] * cond_latents.shape[0]) + [
+                self.info.get_hf_config().start_audio_token
+            ]
+        else:
+            new_token_ids = ([1] * cond_latents.shape[0]) + prompt_token_ids
+
+        return mm_input(
+            prompt_token_ids=new_token_ids,
+            mm_kwargs=mm_kwargs,
+            mm_hashes=inputs.get_mm_hashes(self.info.model_id),
+            mm_placeholders={"audio": [PlaceholderRange(offset=0, length=len(new_token_ids))]},
+        )
 
 
-def input_processor_for_xtts2_gpt(ctx: InputContext, inputs: DecoderOnlyInputs):
-    """
-    We'll accomodate for the extra contditioning token and for the start audio token,
-    we actually insert a -1 repeated for the differecne in length between the conditioning and the tokenized text
-    and then we add 1 for the start audio token
-    Args:
-        ctx:
-        inputs:
-
-    Returns:
-
-    """
-    multi_modal_data = inputs.get("multi_modal_data")
-    if multi_modal_data is None or "audio" not in multi_modal_data:
-        raise ValueError("Missing audio data in multi-modal inputs")
-
-    audio_dict = multi_modal_data['audio']
-    audio = audio_dict.get('embeds')
-
-    is_last_decoding_pass = audio_dict.get("is_logits_only_mode", False)
-
-    prompt_token_ids = inputs.get("prompt_token_ids")
-
-    if not is_last_decoding_pass:
-        # we fill everything with 1 since we don't actually needs text token ids, it would mess up in the sampling step
-        new_token_ids = ([1] * (audio.shape[0])) + [ctx.model_config.hf_config.start_audio_token] # add the start audio generation token
-    else:
-        new_token_ids = ([1] * audio.shape[0]) + prompt_token_ids
-    # the encoding had already been done externally to reuse the embeddings for later use but we
-    # account for the new token that will be added before generation
-    new_prompt = None
-    return token_inputs(prompt_token_ids=new_token_ids,
-                        prompt=new_prompt,
-                        multi_modal_data=multi_modal_data,
-                        multi_modal_placeholders={'audio':[PlaceholderRange(offset=0, length=len(new_token_ids))]})
-
-
-@MULTIMODAL_REGISTRY.register_input_mapper("audio", input_mapper_for_xtts)
-@MULTIMODAL_REGISTRY.register_max_multimodal_tokens("audio", get_xtts_max_audio_tokens)
-@INPUT_REGISTRY.register_dummy_data(dummy_data_for_xtts)
-@INPUT_REGISTRY.register_input_processor(input_processor_for_xtts2_gpt)
+@MULTIMODAL_REGISTRY.register_processor(
+    XttsMultiModalProcessor,
+    info=XttsProcessingInfo,
+    dummy_inputs=XttsDummyInputsBuilder,
+)
 class XttsGPT(nn.Module, SupportsMultiModal, SupportsPP):
     def __init__( # type: ignore
             self,
