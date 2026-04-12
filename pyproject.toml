@@ -58,7 +58,7 @@ classifiers = [
 ]
 
 [project.scripts]
-auralis.openai = "auralis.entrypoints.oai_server:main"
+"auralis.openai" = "auralis.entrypoints.oai_server:main"
 
 [project.optional-dependencies]
 server = [
