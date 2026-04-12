@@ -68,9 +68,7 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
     assert 'device="cuda"' not in xtts_source
     assert 'load_format="pt"' in xtts_source
     assert 'load_format="auto"' not in xtts_source
-    assert 'plugin = "auralis.models.xttsv2.components.vllm_mm_gpt"' in xtts_source
-    assert 'plugins = os.environ.get("VLLM_PLUGINS", "")' in xtts_source
-    assert 'os.environ["VLLM_PLUGINS"] = (plugins + "," + plugin).strip(",")' in xtts_source
+    assert "VLLM_PLUGINS" not in xtts_source
     assert "MultiModalInputs" not in mm_source
     assert "INPUT_REGISTRY" not in mm_source
     assert "register_input_mapper" not in mm_source
