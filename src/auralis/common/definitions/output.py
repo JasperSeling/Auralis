@@ -10,10 +10,6 @@ from IPython.display import Audio, display
 import numpy as np
 import torch
 import torchaudio
-try:
-    from torio.io import CodecConfig
-except ImportError:
-    from torchaudio.io import CodecConfig
 
 
 @dataclass
@@ -122,7 +118,6 @@ class TTSOutput:
                 format=format,
                 encoding="PCM_S" if sample_width == 2 else "PCM_F",
                 bits_per_sample=sample_width * 8,
-                compression = CodecConfig(compression_level=min(8, self.compression)) if format == 'flac' else None
             )
         elif format == 'mp3':
             torchaudio.save(
@@ -130,7 +125,6 @@ class TTSOutput:
                 wav_tensor,
                 self.sample_rate,
                 format="mp3",
-                compression = CodecConfig(bit_rate=self.bit_rate)
             )
         elif format == 'opus':
             torchaudio.save(
@@ -138,7 +132,6 @@ class TTSOutput:
                 wav_tensor,
                 self.sample_rate,
                 format="opus",
-                compression = CodecConfig(compression_level=self.compression)
             )
         elif format == 'aac':
             torchaudio.save(
@@ -146,7 +139,6 @@ class TTSOutput:
                 wav_tensor,
                 self.sample_rate,
                 format="adts",
-                compression = CodecConfig(bit_rate=self.bit_rate)
             )
         elif format == 'pcm':
             # Scale to appropriate range based on sample width
