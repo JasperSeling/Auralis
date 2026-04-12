@@ -54,8 +54,7 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
     ).read_text(encoding="utf-8")
 
     assert xtts_source.startswith(
-        'import os\nos.environ.setdefault("VLLM_USE_V1", "0")\n'
-        'os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")\n'
+        'import os\nos.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")\n'
     )
     assert 'device="cuda"' not in xtts_source
     assert 'load_format="pt"' in xtts_source
@@ -79,7 +78,6 @@ def test_colab_quickstart_sets_vllm_env_before_install_cell():
 
     assert notebook["cells"][0]["source"] == [
         "import os\n",
-        'os.environ["VLLM_USE_V1"] = "0"\n',
         'os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"\n',
     ]
     assert notebook["cells"][1]["source"] == [

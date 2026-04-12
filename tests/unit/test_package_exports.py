@@ -10,7 +10,6 @@ def test_package_init_uses_explicit_top_level_imports():
     assert source.startswith(
         'import os\n'
         '\n'
-        'os.environ.setdefault("VLLM_USE_V1", "0")\n'
         'os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")\n'
     )
     assert "from auralis.core.tts import TTS" in source
