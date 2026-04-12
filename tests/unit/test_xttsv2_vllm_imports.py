@@ -9,5 +9,6 @@ def test_xttsv2_imports_multimodal_data_dict_from_inputs_module():
         encoding="utf-8"
     )
 
-    assert "from vllm.multimodal.inputs import MultiModalDataDict" in source
+    assert "from vllm.inputs import MultiModalDataDict" in source
+    assert "from vllm.multimodal.inputs import MultiModalDataDict" not in source
     assert "from vllm.multimodal import MultiModalDataDict" not in source

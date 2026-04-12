@@ -10,19 +10,16 @@ from torch import Tensor
 from transformers import GPT2Config
 from transformers.feature_extraction_utils import BatchFeature
 
-from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.distributed import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.gpt2 import GPT2Block
 from vllm.model_executor.models.utils import make_layers, make_empty_intermediate_tensors_factory
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems, PlaceholderRange
 from vllm.multimodal.parse import (
@@ -40,6 +37,10 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from typing import Dict, List
 from collections import defaultdict
