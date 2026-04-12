@@ -1,3 +1,7 @@
+import os
+os.environ.setdefault("VLLM_USE_V1", "0")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 import asyncio
 import functools
 import time
@@ -211,10 +215,10 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             raise RuntimeError("Could not find the memory usage for the VLLM model initialization.")
         engine_args = AsyncEngineArgs(
             model=self.gpt_model,
-            device="cuda",
             tensor_parallel_size=self.tp,
             pipeline_parallel_size=self.pp,
             dtype="auto",
+            load_format="pt",
             max_model_len=self.gpt_config.max_text_tokens +
                           self.gpt_config.max_audio_tokens +
                           32 + 5 + 3, # this is from the xttsv2 code, 32 is the conditioning sql
@@ -230,6 +234,10 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             #We round to the nearest multiple of 32 and multiply by max_seq_num to get the max batched number (arbitrary) of tokens
         )
         self.logger.info(f"Initializing VLLM engine with args: {engine_args}")
+        from vllm.model_executor.models import ModelRegistry
+        if "XttsGPT" not in ModelRegistry.get_supported_archs():
+            from auralis.models.xttsv2.components.vllm_mm_gpt import XttsGPT
+            ModelRegistry.register_model("XttsGPT", XttsGPT)
         self.llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     @classmethod
