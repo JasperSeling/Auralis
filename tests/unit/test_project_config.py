@@ -41,7 +41,7 @@ def test_pyproject_registers_vllm_general_plugin():
     pyproject = tomli.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert pyproject["project"]["entry-points"]["vllm.general_plugins"] == {
-        "auralis_xtts": "auralis.models.xttsv2.components.vllm_mm_gpt",
+        "auralis_xtts": "auralis.models.xttsv2.components.vllm_mm_gpt:register_vllm_models",
     }
 
 

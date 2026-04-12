@@ -61,7 +61,7 @@ classifiers = [
 auralis-openai = "auralis.entrypoints.oai_server:main"
 
 [project.entry-points."vllm.general_plugins"]
-auralis_xtts = "auralis.models.xttsv2.components.vllm_mm_gpt"
+auralis_xtts = "auralis.models.xttsv2.components.vllm_mm_gpt:register_vllm_models"
 
 [project.optional-dependencies]
 server = [
