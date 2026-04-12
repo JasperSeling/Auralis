@@ -15,7 +15,7 @@ import torchaudio
 from torch import nn
 
 from vllm import AsyncLLMEngine, AsyncEngineArgs, TokensPrompt, RequestOutput
-from vllm.multimodal import MultiModalDataDict
+from vllm.multimodal.inputs import MultiModalDataDict
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils import Counter
 
