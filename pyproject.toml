@@ -7,7 +7,7 @@ name = "auralis"
 version = "0.2.9"
 description = "A faster implementation for TTS models, to be used in highly async environments"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.13"
 authors = [
     { name = "Marco Lironi", email = "marcolironi@astramind.ai" },
 ]
@@ -15,10 +15,10 @@ dependencies = [
     # CUDA stack - keep torch and torchaudio pinned together.
     "torch==2.5.1",
     "torchaudio==2.5.1",
-    # vLLM - code is written for this API version.
-    "vllm==0.6.4.post1",
+    # vLLM - pinned to a Python 3.12-compatible API target.
+    "vllm==0.7.3",
     # Transformers
-    "transformers==4.46.0",
+    "transformers==4.48.2",
     "tokenizers>=0.19.0",
     # Audio
     "sounddevice>=0.4.6",
