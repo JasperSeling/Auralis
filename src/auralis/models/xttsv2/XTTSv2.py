@@ -211,6 +211,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             raise RuntimeError("Could not find the memory usage for the VLLM model initialization.")
         engine_args = AsyncEngineArgs(
             model=self.gpt_model,
+            device="cuda",
             tensor_parallel_size=self.tp,
             pipeline_parallel_size=self.pp,
             dtype="auto",

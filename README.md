@@ -64,7 +64,7 @@ output.save('hello.wav')
 
 or via **cli** using the openai compatible server
 ```commandline
-auralis.openai --host 127.0.0.1 --port 8000 --model AstraMindAI/xttsv2 --gpt_model AstraMindAI/xtts2-gpt --max_concurrency 8 --vllm_logging_level warn  
+auralis-openai --host 127.0.0.1 --port 8000 --model AstraMindAI/xttsv2 --gpt_model AstraMindAI/xtts2-gpt --max_concurrency 8 --vllm_logging_level warn
 ```
 You can see [here](https://github.com/astramind-ai/Auralis/tree/main/docs/USING_OAI_SERVER.md) for a more in-depth explanation or try it out with this [example](https://github.com/astramind-ai/Auralis/tree/main/examples/use_openai_server.py)
 

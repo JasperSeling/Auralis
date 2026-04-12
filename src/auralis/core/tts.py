@@ -84,6 +84,7 @@ class TTS:
         Raises:
             ValueError: If the model cannot be loaded from the specified path.
         """
+        import auralis.models  # noqa: F401
         from auralis.models.registry import MODEL_REGISTRY
 
         try:

@@ -15,8 +15,8 @@ dependencies = [
     # CUDA stack - keep torch and torchaudio pinned together.
     "torch==2.5.1",
     "torchaudio==2.5.1",
-    # vLLM - pinned to a Python 3.12-compatible API target.
-    "vllm==0.7.3",
+    # vLLM - pinned to the minimal Python 3.12-compatible API target.
+    "vllm==0.6.5",
     # Transformers
     "transformers==4.48.2",
     "tokenizers>=0.19.0",
@@ -36,7 +36,7 @@ dependencies = [
     "cutlet>=0.4.0",
     # Runtime dependencies used by current package imports
     "huggingface-hub>=0.24.0",
-    "numpy>=1.26.0",
+    "numpy>=1.26.0,<2.0",
     "fsspec>=2024.0.0",
     "networkx>=3.0",
     "packaging>=23.0",
@@ -58,7 +58,7 @@ classifiers = [
 ]
 
 [project.scripts]
-"auralis.openai" = "auralis.entrypoints.oai_server:main"
+auralis-openai = "auralis.entrypoints.oai_server:main"
 
 [project.optional-dependencies]
 server = [
