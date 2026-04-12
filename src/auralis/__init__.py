@@ -1,3 +1,14 @@
+import os
+
+os.environ.setdefault("VLLM_USE_V1", "0")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+from auralis.core.tts import TTS
+from auralis.common.definitions.requests import TTSRequest
+from auralis.common.definitions.output import TTSOutput
+from auralis.common.definitions.enhancer import AudioPreprocessingConfig
+from auralis.common.logging.logger import setup_logger, set_vllm_logging_level
+
 __all__ = [
     "TTS",
     "TTSRequest",
@@ -6,26 +17,3 @@ __all__ = [
     "setup_logger",
     "set_vllm_logging_level",
 ]
-
-
-def __getattr__(name):
-    if name == "TTS":
-        from .core.tts import TTS
-        return TTS
-    if name == "TTSRequest":
-        from .common.definitions.requests import TTSRequest
-        return TTSRequest
-    if name == "TTSOutput":
-        from .common.definitions.output import TTSOutput
-        return TTSOutput
-    if name == "AudioPreprocessingConfig":
-        from .common.definitions.enhancer import AudioPreprocessingConfig
-        return AudioPreprocessingConfig
-    if name in {"setup_logger", "set_vllm_logging_level"}:
-        from .common.logging.logger import setup_logger, set_vllm_logging_level
-
-        return {
-            "setup_logger": setup_logger,
-            "set_vllm_logging_level": set_vllm_logging_level,
-        }[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

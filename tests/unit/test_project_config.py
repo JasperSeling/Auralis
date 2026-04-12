@@ -7,7 +7,7 @@ import tomli
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_pyproject_uses_python312_colab_dependency_stack():
+def test_pyproject_uses_numpy2_compatible_runtime_stack():
     pyproject = tomli.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = pyproject["project"]["dependencies"]
 
@@ -17,10 +17,10 @@ def test_pyproject_uses_python312_colab_dependency_stack():
     assert "torchaudio==2.10.0" in dependencies
     assert "transformers>=4.56.0,<5" in dependencies
     assert "thinc>=8.3.0" in dependencies
-    assert "spacy==3.7.5" in dependencies
+    assert "spacy>=3.8.0" in dependencies
     assert "numpy>=1.26.0" in dependencies
-    assert "ipython==7.34.0" in dependencies
-    assert "spacy>=3.7.5" not in dependencies
+    assert all(not dependency.startswith("ipython") for dependency in dependencies)
+    assert "spacy==3.7.5" not in dependencies
     assert "ipython>=7.34.0" not in dependencies
     assert "ipython>=8.0.0" not in dependencies
     assert "numpy>=1.26.0,<2.0" not in dependencies
