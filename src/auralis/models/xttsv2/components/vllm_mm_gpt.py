@@ -783,7 +783,7 @@ class XttsGPT(nn.Module, SupportsMultiModal, SupportsPP):
 
 
 def register_vllm_models():
-    """Called by vLLM plugin system in every worker process."""
+    """Called by vLLM general plugin system in every worker process."""
     from vllm.model_executor.models import ModelRegistry
 
     if "XttsGPT" not in ModelRegistry.get_supported_archs():

@@ -18,13 +18,14 @@ def test_pyproject_uses_numpy2_compatible_runtime_stack():
     assert "transformers>=4.56.0,<5" in dependencies
     assert "thinc>=8.3.12,<8.4.0" in dependencies
     assert "spacy>=3.8.0,<3.9.0" in dependencies
-    assert "numpy>=1.26.0" in dependencies
+    assert "numpy>=2.0.0,<2.2.0" in dependencies
     assert all(not dependency.startswith("ipython") for dependency in dependencies)
     assert "thinc>=8.3.0" not in dependencies
     assert "spacy==3.7.5" not in dependencies
     assert "spacy>=3.8.0" not in dependencies
     assert "ipython>=7.34.0" not in dependencies
     assert "ipython>=8.0.0" not in dependencies
+    assert "numpy>=1.26.0" not in dependencies
     assert "numpy>=1.26.0,<2.0" not in dependencies
 
 
@@ -67,16 +68,16 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
     assert 'device="cuda"' not in xtts_source
     assert 'load_format="pt"' in xtts_source
     assert 'load_format="auto"' not in xtts_source
-    assert 'plugin_module = "auralis.models.xttsv2.components.vllm_mm_gpt"' in xtts_source
-    assert 'existing = os.environ.get("VLLM_PLUGINS", "")' in xtts_source
-    assert 'os.environ["VLLM_PLUGINS"] = (existing + "," + plugin_module).strip(",")' in xtts_source
+    assert 'plugin = "auralis.models.xttsv2.components.vllm_mm_gpt"' in xtts_source
+    assert 'plugins = os.environ.get("VLLM_PLUGINS", "")' in xtts_source
+    assert 'os.environ["VLLM_PLUGINS"] = (plugins + "," + plugin).strip(",")' in xtts_source
     assert "MultiModalInputs" not in mm_source
     assert "INPUT_REGISTRY" not in mm_source
     assert "register_input_mapper" not in mm_source
     assert "register_max_multimodal_tokens" not in mm_source
     assert "@MULTIMODAL_REGISTRY.register_processor" in mm_source
     assert "def register_vllm_models():" in mm_source
-    assert '"""Called by vLLM plugin system in every worker process."""' in mm_source
+    assert '"""Called by vLLM general plugin system in every worker process."""' in mm_source
     assert "from vllm.model_executor.models import ModelRegistry" in mm_source
     assert 'if "XttsGPT" not in ModelRegistry.get_supported_archs():' in mm_source
     assert 'ModelRegistry.register_model("XttsGPT", XttsGPT)' in mm_source

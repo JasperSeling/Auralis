@@ -37,7 +37,7 @@ dependencies = [
     "cutlet>=0.4.0",
     # Runtime dependencies used by current package imports
     "huggingface-hub>=0.24.0",
-    "numpy>=1.26.0",
+    "numpy>=2.0.0,<2.2.0",
     "fsspec>=2024.0.0",
     "networkx>=3.0",
     "packaging>=23.0",
