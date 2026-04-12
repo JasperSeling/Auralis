@@ -1,6 +1,11 @@
 import os
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
+plugin_module = "auralis.models.xttsv2.components.vllm_mm_gpt"
+existing = os.environ.get("VLLM_PLUGINS", "")
+if plugin_module not in existing:
+    os.environ["VLLM_PLUGINS"] = (existing + "," + plugin_module).strip(",")
+
 import asyncio
 import functools
 import time

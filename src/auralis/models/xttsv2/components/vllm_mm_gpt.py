@@ -781,6 +781,15 @@ class XttsGPT(nn.Module, SupportsMultiModal, SupportsPP):
             (f"Missing weights: {set(params_dict.keys()) - loaded_names}, "
              f"this probably means you are using an incompatible model, \n\nyour model has this weights: {set(params_dict.keys())}")
 
+
+def register_vllm_models():
+    """Called by vLLM plugin system in every worker process."""
+    from vllm.model_executor.models import ModelRegistry
+
+    if "XttsGPT" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model("XttsGPT", XttsGPT)
+
+
 class GPT2Model(nn.Module):
 
     def __init__(

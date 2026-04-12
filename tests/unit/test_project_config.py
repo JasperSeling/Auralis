@@ -36,6 +36,14 @@ def test_openai_server_console_script_uses_hyphenated_name():
     }
 
 
+def test_pyproject_registers_vllm_general_plugin():
+    pyproject = tomli.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["entry-points"]["vllm.general_plugins"] == {
+        "auralis_xtts": "auralis.models.xttsv2.components.vllm_mm_gpt",
+    }
+
+
 def test_tts_lazy_imports_model_package_before_registry_lookup():
     source = (ROOT / "src" / "auralis" / "core" / "tts.py").read_text(encoding="utf-8")
 
@@ -59,13 +67,19 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
     assert 'device="cuda"' not in xtts_source
     assert 'load_format="pt"' in xtts_source
     assert 'load_format="auto"' not in xtts_source
-    assert "from vllm.model_executor.models import ModelRegistry" in xtts_source
-    assert 'ModelRegistry.register_model("XttsGPT", XttsGPT)' in xtts_source
+    assert 'plugin_module = "auralis.models.xttsv2.components.vllm_mm_gpt"' in xtts_source
+    assert 'existing = os.environ.get("VLLM_PLUGINS", "")' in xtts_source
+    assert 'os.environ["VLLM_PLUGINS"] = (existing + "," + plugin_module).strip(",")' in xtts_source
     assert "MultiModalInputs" not in mm_source
     assert "INPUT_REGISTRY" not in mm_source
     assert "register_input_mapper" not in mm_source
     assert "register_max_multimodal_tokens" not in mm_source
     assert "@MULTIMODAL_REGISTRY.register_processor" in mm_source
+    assert "def register_vllm_models():" in mm_source
+    assert '"""Called by vLLM plugin system in every worker process."""' in mm_source
+    assert "from vllm.model_executor.models import ModelRegistry" in mm_source
+    assert 'if "XttsGPT" not in ModelRegistry.get_supported_archs():' in mm_source
+    assert 'ModelRegistry.register_model("XttsGPT", XttsGPT)' in mm_source
     assert "XttsMultiModalProcessor" in mm_source
     assert "XttsProcessingInfo" in mm_source
     assert "XttsDummyInputsBuilder" in mm_source
