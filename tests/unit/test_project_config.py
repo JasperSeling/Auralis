@@ -16,11 +16,13 @@ def test_pyproject_uses_numpy2_compatible_runtime_stack():
     assert "torch==2.10.0" in dependencies
     assert "torchaudio==2.10.0" in dependencies
     assert "transformers>=4.56.0,<5" in dependencies
-    assert "thinc>=8.3.0" in dependencies
-    assert "spacy>=3.8.0" in dependencies
+    assert "thinc>=8.3.12,<8.4.0" in dependencies
+    assert "spacy>=3.8.0,<3.9.0" in dependencies
     assert "numpy>=1.26.0" in dependencies
     assert all(not dependency.startswith("ipython") for dependency in dependencies)
+    assert "thinc>=8.3.0" not in dependencies
     assert "spacy==3.7.5" not in dependencies
+    assert "spacy>=3.8.0" not in dependencies
     assert "ipython>=7.34.0" not in dependencies
     assert "ipython>=8.0.0" not in dependencies
     assert "numpy>=1.26.0,<2.0" not in dependencies

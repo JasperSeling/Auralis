@@ -27,8 +27,8 @@ dependencies = [
     "librosa>=0.10.0",
     # NLP / languages
     "langid>=1.1.6",
-    "thinc>=8.3.0",
-    "spacy>=3.8.0",
+    "thinc>=8.3.12,<8.4.0",
+    "spacy>=3.8.0,<3.9.0",
     "num2words>=0.5.12",
     "hangul-romanize>=0.1.0",
     "opencc-python-reimplemented>=0.1.7",
