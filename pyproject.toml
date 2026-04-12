@@ -27,7 +27,8 @@ dependencies = [
     "librosa>=0.10.0",
     # NLP / languages
     "langid>=1.1.6",
-    "spacy==3.7.5",
+    "thinc>=8.3.0",
+    "spacy>=3.7.5",
     "num2words>=0.5.12",
     "hangul-romanize>=0.1.0",
     "opencc-python-reimplemented>=0.1.7",
@@ -44,7 +45,7 @@ dependencies = [
     "nvidia-ml-py>=12.0.0",
     # Utilities
     "nest_asyncio>=1.6.0",
-    "ipython>=8.0.0",
+    "ipython>=7.34.0",
     "aiofiles>=23.0.0",
     "cachetools>=5.3.0",
     "colorama>=0.4.6",
