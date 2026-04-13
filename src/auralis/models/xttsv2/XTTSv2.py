@@ -18,6 +18,7 @@ import torchaudio
 from torch import nn
 
 from vllm import AsyncLLMEngine, AsyncEngineArgs, TokensPrompt, RequestOutput
+from vllm.config import AttentionConfig
 from vllm.inputs import MultiModalDataDict
 from vllm.sampling_params import RequestOutputKind
 from vllm.utils.counter import Counter
@@ -217,6 +218,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             tensor_parallel_size=self.tp,
             pipeline_parallel_size=self.pp,
             dtype="auto",
+            attention_config=AttentionConfig(backend="TRITON_ATTN"),
             load_format="pt",
             max_model_len=self.gpt_config.max_text_tokens +
                           self.gpt_config.max_audio_tokens +

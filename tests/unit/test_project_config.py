@@ -68,6 +68,8 @@ def test_xtts_vllm_compatibility_source_hooks_are_present():
     assert 'device="cuda"' not in xtts_source
     assert 'load_format="pt"' in xtts_source
     assert 'load_format="auto"' not in xtts_source
+    assert "from vllm.config import AttentionConfig" in xtts_source
+    assert 'attention_config=AttentionConfig(backend="TRITON_ATTN")' in xtts_source
     assert "VLLM_PLUGINS" not in xtts_source
     assert "MultiModalInputs" not in mm_source
     assert "INPUT_REGISTRY" not in mm_source
