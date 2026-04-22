@@ -36,10 +36,11 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalInputs,
+    MultiModalKwargs,
     NestedTensors,
 )
 from vllm.multimodal.parse import MultiModalDataParser
