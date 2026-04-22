@@ -20,19 +20,8 @@ AudioOutputGenerator = AsyncGenerator[TTSOutput, None]
 SpeakerEmbeddings = torch.Tensor
 GPTLikeDecoderConditioning = torch.Tensor
 RequestsIds = List
-#: Per-sequence offsets into the hidden-states tensor marking the end of the
-#: audio-conditioning prefix. Emitted by engines that extract hidden states
-#: via vLLM V1's KV connector (see ``XTTSv2Engine.get_generation_context``).
-AudioStarts = List[int]
 
 TokenGeneratorsAndPossiblyConditioning = Union[
-    Tuple[
-        List[AudioTokenGenerator],
-        RequestsIds,
-        SpeakerEmbeddings,
-        Union[List[GPTLikeDecoderConditioning], GPTLikeDecoderConditioning],
-        AudioStarts,
-    ],
     Tuple[
         List[AudioTokenGenerator],
         RequestsIds,
@@ -104,7 +93,6 @@ class BaseAsyncTTSEngine(ABC, torch.nn.Module):
             generator: AudioTokenGenerator,
             speaker_embeddings: SpeakerEmbeddings,
             multimodal_data: GPTLikeDecoderConditioning = None,
-            audio_start: int = 0,
             request: TTSRequest = None,
     ) -> AudioOutputGenerator:
         """Generate speech from tokens with optional conditioning.
@@ -116,10 +104,6 @@ class BaseAsyncTTSEngine(ABC, torch.nn.Module):
             generator (AudioTokenGenerator): Token generator from the first phase.
             speaker_embeddings (SpeakerEmbeddings): Speaker embeddings for voice cloning.
             multimodal_data (GPTLikeDecoderConditioning, optional): GPT conditioning data.
-            audio_start (int, optional): Offset into the engine's hidden-states
-                tensor marking the end of the audio-conditioning prefix. Used
-                by engines that extract hidden states via vLLM V1 KV connectors
-                (e.g. XTTSv2). Defaults to ``0`` for engines that ignore it.
             request (TTSRequest, optional): Original TTS request for reference.
 
         Returns:

@@ -1,7 +1,5 @@
 import asyncio
 import functools
-import shutil
-import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -14,11 +12,12 @@ import librosa
 import numpy as np
 import torch
 import torchaudio
-from safetensors import safe_open
 from torch import nn
 
-from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams, TokensPrompt, RequestOutput
+from vllm import AsyncLLMEngine, AsyncEngineArgs, TokensPrompt, RequestOutput
+from vllm.multimodal import MultiModalDataDict
 from vllm.sampling_params import RequestOutputKind
+from vllm.utils import Counter
 
 from ..base import BaseAsyncTTSEngine, ConditioningConfig, TokenGeneratorsAndPossiblyConditioning
 from ...common.logging.logger import setup_logger
@@ -26,11 +25,13 @@ from ...common.definitions.output import TTSOutput
 from ...common.definitions.requests import TTSRequest
 from ...common.utilities import wav_to_mel_cloning, load_audio
 
-from .components.vllm_mm_gpt import AUDIO_PLACEHOLDER_TOKEN_ID, LearnedPositionEmbeddings
+from .components.vllm_mm_gpt import LearnedPositionEmbeddings
 from .config.tokenizer import XTTSTokenizerFast
 from .config.xttsv2_config import XTTSConfig
 from .config.xttsv2_gpt_config import XTTSGPTConfig
 
+from .components.vllm.hidden_state_collector import HiddenStatesCollector
+from .components.vllm.hijack import ExtendedSamplingParams, LogitsRepetitionPenalizer
 from .components.tts.layers.xtts.hifigan_decoder import HifiDecoder
 from .components.tts.layers.xtts.latent_encoder import ConditioningEncoder
 from .components.tts.layers.xtts.perceiver_encoder import PerceiverResampler
@@ -81,14 +82,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         self.tp = tensor_parallel_size
         self.pp = pipeline_parallel_size
         self.tokenizer = XTTSTokenizerFast.from_pretrained(self.gpt_model)
-
-        # Per-instance directory for V1 extract_hidden_states safetensors dumps.
-        # Each XTTSv2Engine gets its own sub-directory to avoid collisions across
-        # multiple TTS instances in the same process.
-        self.hidden_states_dir = (
-            Path(tempfile.gettempdir()) / f"auralis-hs-{uuid.uuid4().hex[:8]}"
-        )
-        self.hidden_states_dir.mkdir(parents=True, exist_ok=True)
+        self.request_counter = Counter()
 
         self.max_concurrency = kwargs.pop('max_concurrency', 10)
         semaphore_concurrency = max(1,self.max_concurrency // 6) * self.tp
@@ -162,11 +156,9 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         for different concurrency levels. This helps in optimizing resource allocation
         for the VLLM engine.
         """
-        # thanks to NinjaPerson24119
-        amd = 2.0  # AMD GPUs are less VRAM efficient than NVIDIA GPUs
-
+        # empirically found values
         x = np.array([2, 5, 10, 16])
-        y = np.array([1.25 * amd, 1.35 * amd, 1.45 * amd, 1.625 * amd])
+        y = np.array([1.25, 1.35, 1.45, 1.625])
 
         # polynomial fit
         coefficients = np.polyfit(x, y, 2)
@@ -215,28 +207,6 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         mem_utils = self.get_memory_percentage(self.max_gb_for_vllm_model * 1024 ** 3) #
         if not mem_utils:
             raise RuntimeError("Could not find the memory usage for the VLLM model initialization.")
-        # V1 Engine: configure per-token hidden-state extraction via the
-        # speculative `extract_hidden_states` method + ExampleHiddenStatesConnector
-        # KV connector. Hidden states are written to `hidden_states_dir` as
-        # safetensors and consumed by `process_tokens_to_speech` for HiFi-GAN.
-        last_layer_id = self.gpt_config.num_hidden_layers - 1
-        speculative_config = {
-            "method": "extract_hidden_states",
-            "num_speculative_tokens": 1,
-            "draft_model_config": {
-                "hf_config": {
-                    "eagle_aux_hidden_state_layer_ids": [last_layer_id],
-                }
-            },
-        }
-        kv_transfer_config = {
-            "kv_connector": "ExampleHiddenStatesConnector",
-            "kv_role": "kv_producer",
-            "kv_connector_extra_config": {
-                "shared_storage_path": str(self.hidden_states_dir),
-            },
-        }
-
         engine_args = AsyncEngineArgs(
             model=self.gpt_model,
             tensor_parallel_size=self.tp,
@@ -255,8 +225,6 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                     self.gpt_config.max_audio_tokens +
                                     32 + 5 + 3) * max_seq_num,
             #We round to the nearest multiple of 32 and multiply by max_seq_num to get the max batched number (arbitrary) of tokens
-            speculative_config=speculative_config,
-            kv_transfer_config=kv_transfer_config,
         )
         self.logger.info(f"Initializing VLLM engine with args: {engine_args}")
         self.llm_engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -370,14 +338,10 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             List[torch.Tensor]: List of merged conditioning tensors.
         """
         cond_latents = []
-        engine_dtype = self.llm_engine.vllm_config.model_config.dtype
         for text_embedding in text_conditioning:
             # Concatenate along sequence dimension
-            cond_latents.append(
-                torch.cat([audio_conditioning, text_embedding], dim=1)
-                .squeeze(0)
-                .to(engine_dtype)
-            )
+            cond_latents.append((torch.cat([audio_conditioning, text_embedding], dim=1).squeeze(0)
+                                 .to(self.llm_engine.engine.model_config.dtype)))
         return cond_latents
 
     def get_gpt_cond_latents(self, audio, sr, length: int = 30, chunk_length: int = 6):
@@ -648,6 +612,79 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             )
             return result
 
+    async def get_model_logits(
+            self,
+            token_ids: List[int],
+            conditioning: MultiModalDataDict,
+            request_id: str,
+    ) -> torch.Tensor:
+        """Get model logits for token generation.
+
+        Args:
+            token_ids (List[int]): Input token IDs.
+            conditioning (MultiModalDataDict): Conditioning data.
+            request_id (str): Unique request identifier.
+
+        Returns:
+            torch.Tensor: Model logits.
+        """
+        """
+        Get model logits for a request with retry logic for empty hidden states.
+
+        Args:
+            token_ids: Input token IDs
+            conditioning: Conditioning data
+            request_id: Unique request ID
+        """
+        request_id = f"{request_id}_logits"
+
+
+        # Reset token_ids on each attempt
+        token_ids = ([self.mel_bos_token_id] + list(token_ids) + [self.mel_eos_token_id] * 4)
+        # we need 5 eos tokens
+
+        engine_inputs = TokensPrompt(prompt_token_ids=token_ids)
+        conditioning['audio']['sequence_length'] = len(token_ids)
+
+        engine_inputs["multi_modal_data"] = conditioning
+
+        hidden_states_collector = HiddenStatesCollector()
+        # Bind the collector to this request
+        bound_collector = hidden_states_collector.bind_to_request(request_id)
+
+        # Set up sampling parameters with the bound collector
+        sampling_params = ExtendedSamplingParams(
+            detokenize=False,
+            request_id=request_id,
+            max_tokens=1,
+            hidden_state_collector=bound_collector,
+            output_kind=RequestOutputKind.FINAL_ONLY
+        )
+
+        # Generate with unique request ID
+        generator = self.llm_engine.generate(
+            prompt=engine_inputs,
+            sampling_params=sampling_params,
+            request_id=request_id
+        )
+
+        async for output in generator:  # consume the generator
+            if output.finished:
+                pass
+
+        # Get the collected hidden states
+        hidden_states = await hidden_states_collector.get_hidden_states(request_id)
+
+        if hidden_states is None:
+            raise RuntimeError(
+                f"No hidden states collected for request {request_id}. "
+                f"This should never happen! Please report this issue on GitHub."
+            )
+        start_of_audio_hs = conditioning["audio"]["embeds"].shape[0] # type: ignore
+        # Successfully got hidden states
+        return self.final_norm(hidden_states[start_of_audio_hs:-5, ...].unsqueeze(0).to(self.device).to(self.dtype))
+
+
     @torch.inference_mode()
     async def get_generation_context(self,
                                      request: TTSRequest,
@@ -681,48 +718,35 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                                                                 split_text=True)
             gpt_embed_inputs = await self._merge_conditioning(text_embeddings, gpt_cond_latent)
 
-        # Start all requests in parallel.
-        #
-        # V1 flow: build prompts entirely from audio placeholders followed by
-        # the start-of-audio-generation token. vLLM scatters the pre-computed
-        # conditioning embeddings (audio_cond + text_emb) into placeholder
-        # positions via XttsGPT.get_input_embeddings(). No manual logits-only
-        # pass and no custom sampling params — native repetition_penalty.
-        generators: List[AsyncGenerator[RequestOutput, None]] = []
-        requests_id: List[str] = []
-        audio_starts: List[int] = []
-
-        assert gpt_embed_inputs is not None, (
-            "XTTSv2Engine requires merged conditioning embeddings; received None."
-        )
-
-        for seq_index, merged_embeds in enumerate(gpt_embed_inputs):
-            merged_len = int(merged_embeds.shape[0])
-            prompt_token_ids = (
-                [AUDIO_PLACEHOLDER_TOKEN_ID] * merged_len + [self.mel_bos_token_id]
-            )
-            audio_starts.append(merged_len)
-
-            sampling_params = SamplingParams(
+        # Start all requests in parallel
+        generators = []
+        requests_id = []
+        for seq_index, sequence in enumerate(tokens_list):
+            sampling_params = ExtendedSamplingParams(
                 temperature=request.temperature,
                 top_p=request.top_p,
-                top_k=request.top_k,
-                repetition_penalty=request.repetition_penalty,
-                max_tokens=self.gpt_config.gpt_max_audio_tokens,
-                ignore_eos=True,  # stop only on mel_eos, not tokenizer EOS
-                stop_token_ids=[self.mel_eos_token_id],
                 detokenize=False,
-                output_kind=RequestOutputKind.FINAL_ONLY,
+                request_id=uuid.uuid4(),
+                top_k=request.top_k,
+                logits_processors=[LogitsRepetitionPenalizer(request.repetition_penalty)],
+                repetition_penalty=1.0,  # Since we're handling repetition penalty manually
+                max_tokens=self.gpt_config.gpt_max_audio_tokens,
+                ignore_eos=True,  # Ignore the tokenizer eos token since it is for textual generation
+                stop_token_ids=[self.mel_eos_token_id],
+                output_kind=RequestOutputKind.FINAL_ONLY
             )
 
-            engine_inputs: TokensPrompt = {
-                "prompt_token_ids": prompt_token_ids,
-                "multi_modal_data": {
-                    "audio": {"embeds": merged_embeds},
-                },
-            }
-
-            request_id = f"{request.request_id}_{seq_index}"
+            engine_inputs = TokensPrompt(prompt_token_ids=sequence)
+            if gpt_embed_inputs is not None:
+                engine_inputs["multi_modal_data"] = {
+                    "audio": {
+                        "embeds": gpt_embed_inputs[seq_index],
+                        "is_logits_only_mode": False,
+                        "sequence_length": len(sequence)
+                    }
+                }
+            request_id =f"{request.request_id}_{seq_index}"
+            # Get audio token generator from VLLM
             token_generator = self.llm_engine.generate(
                 prompt=engine_inputs,
                 sampling_params=sampling_params,
@@ -731,7 +755,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             generators.append(token_generator)
             requests_id.append(request_id)
 
-        return generators, requests_id, speaker_embeddings, gpt_embed_inputs, audio_starts
+        return generators, requests_id, speaker_embeddings, gpt_embed_inputs
 
     @torch.inference_mode()
     async def process_tokens_to_speech(
@@ -739,7 +763,6 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             generator: AsyncGenerator[RequestOutput, None],
             speaker_embeddings: Optional[torch.Tensor] = None,
             multimodal_data: Optional[torch.Tensor] = None,
-            audio_start: int = 0,
             request: TTSRequest = None,
     ) -> AsyncGenerator[TTSOutput, None]:
         """Convert generated tokens to speech waveforms.
@@ -747,69 +770,49 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         Args:
             generator (AsyncGenerator[RequestOutput, None]): Token generator.
             speaker_embeddings (Optional[torch.Tensor], optional): Speaker embeddings.
-            multimodal_data (Optional[torch.Tensor], optional): UNUSED. Kept in
-                the signature to preserve compatibility with
-                ``BaseAsyncTTSEngine.process_tokens_to_speech``. The hidden
-                states needed by the HiFi-GAN decoder are now supplied by the
-                V1 KV connector, not by this tensor.
-            audio_start (int): Index into the hidden-states tensor marking the
-                end of the audio-conditioning prefix. Equal to
-                ``merged_embeds.shape[0]`` for the sequence.
+            multimodal_data (Optional[torch.Tensor], optional): Additional multimodal data.
             request (TTSRequest, optional): Original TTS request.
 
         Yields:
             TTSOutput: Generated speech chunks.
         """
         assert speaker_embeddings is not None, "Speaker embeddings must be provided for speech generation with XTTSv2."
+        assert multimodal_data is not None, "Multimodal data must be provided for speech generation with XTTSv2."
 
-        del multimodal_data  # intentionally unused; see docstring.
 
         async for output in generator:
-            if not output.finished:
-                continue
 
-            # V1 Engine: hidden states are dumped to safetensors by
-            # ExampleHiddenStatesConnector. The path is returned through
-            # `kv_transfer_params`.
-            kv_params = getattr(output, "kv_transfer_params", None) or {}
-            hs_path = kv_params.get("hidden_states_path")
-            if hs_path is None:
-                raise RuntimeError(
-                    f"Missing hidden_states_path in kv_transfer_params for "
-                    f"request {output.request_id}. Check speculative_config / "
-                    f"kv_transfer_config in init_vllm_engine()."
+            if output.finished:
+                # get the hidden states
+                hidden_states = await self.get_model_logits(
+                    list(output.outputs[0].token_ids),
+                    {
+                        "audio": {
+                            'embeds': multimodal_data,  # Use multimodal data for conditioning
+                            "is_logits_only_mode": True,
+                            "sequence_length": False # to be inserted later
+                        },
+                    },
+                    output.request_id
                 )
 
-            with safe_open(hs_path, framework="pt", device=str(self.device)) as f:
-                # shape: [prompt_len + gen_len, num_layers_selected, hidden]
-                hidden_states = f.get_tensor("hidden_states")
 
-            # Skip the audio-conditioning prefix; drop the last 5 tokens to
-            # preserve the legacy tail trim (mel EOS handling inherited from
-            # the original XTTSv2 implementation). Select the last (only)
-            # captured layer along the middle dimension.
-            hs = hidden_states[audio_start:-5, -1, :]
-            hs = self.final_norm(hs.unsqueeze(0).to(self.device).to(self.dtype))
+                async with self.decoder_semaphore:
+                    async with self.cuda_memory_manager():
+                        wav = (await asyncio.to_thread(self.hifigan_decoder,
+                                hidden_states,
+                                g=speaker_embeddings
+                            )).cpu().detach().numpy().squeeze()
+                         # noqa
 
-            async with self.decoder_semaphore:
-                async with self.cuda_memory_manager():
-                    wav = (await asyncio.to_thread(
-                        self.hifigan_decoder, hs, g=speaker_embeddings
-                    )).cpu().detach().numpy().squeeze()
+                        # yield the audio output
+                        yield TTSOutput(array= wav,
+                                        start_time = request.start_time,
+                                        token_length = len(output.outputs[0].token_ids)
+                                        )
 
-                    yield TTSOutput(
-                        array=wav,
-                        start_time=request.start_time,
-                        token_length=len(output.outputs[0].token_ids),
-                    )
+
 
     async def shutdown(self):
-        """Shut down the vLLM V1 engine and clean up hidden-state dumps."""
-        try:
-            await self.llm_engine.shutdown()
-        except Exception as exc:  # pragma: no cover - best-effort shutdown
-            self.logger.warning(f"AsyncLLM.shutdown() raised: {exc!r}")
-        await asyncio.to_thread(
-            shutil.rmtree, self.hidden_states_dir, ignore_errors=True
-        )
+        self.llm_engine.shutdown_background_loop()
 

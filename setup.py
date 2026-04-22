@@ -3,31 +3,20 @@ from pathlib import Path
 from setuptools import setup, find_packages
 import sys
 import platform
-import warnings
-
 
 def check_platform():
-    """Warn (do not fail) when installing on non-Linux platforms.
-
-    vLLM's GPU runtime requires Linux, but developers often install Auralis
-    on Windows/macOS for editing, type-checking, and unit tests that do not
-    exercise vLLM. Emitting a warning keeps ``pip install`` functional on
-    those hosts while making the limitation explicit.
-    """
-    if sys.platform not in ('linux', 'linux2'):
-        warnings.warn(
-            f"Auralis' runtime dependency vLLM only supports Linux; "
-            f"current platform is {platform.system()}. Installation will "
-            f"proceed for local development, but inference will not work "
-            f"outside a Linux host with a CUDA GPU.",
-            stacklevel=2,
+    if sys.platform != 'linux' and sys.platform != 'linux2':
+        raise RuntimeError(
+            f"""
+            Following vllm requirements are not met:
+            Current platform: {platform.system()} but only linux platforms are supported.
+            """
         )
-
 
 check_platform()
 setup(
     name='auralis',
-    version='0.3.0',
+    version='0.2.8.post2',
     description='This is a faster implementation for TTS models, to be used in highly async environment',
     long_description=Path("README.md").read_text(),
     long_description_content_type="text/markdown",
@@ -62,17 +51,18 @@ setup(
         "pyloudnorm",
         "pytest",
         "pypinyin",
-        "safetensors>=0.4.5",
+        "safetensors",
         "sounddevice",
         "soundfile",
-        "spacy==3.7.5",
+        "spacy>=3.8.0",
         "setuptools",
+        "safetensors",
         "torchaudio",
         "tokenizers",
         "transformers",
-        "vllm>=0.14.0",
+        "vllm==0.6.4.post1",
         "nvidia-ml-py",
-        "numpy>=1.26",
+        "numpy",
         "langid"
 
     ],

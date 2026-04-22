@@ -115,35 +115,18 @@ class TTS:
         """
         conditioning_config = self.tts_engine.conditioning_config
         input_request.start_time = time.time()
-        audio_starts: Optional[List[int]] = None
-
         if input_request.context_partial_function:
-            result = await input_request.context_partial_function(input_request)
-            # V1-aware engines (e.g. XTTSv2) return a 5-tuple with audio_starts.
-            # Older engines still return the legacy 4-tuple.
-            if len(result) == 5:
-                (audio_token_generators, requests_ids,
-                 speaker_embeddings,
-                 gpt_like_decoder_conditioning,
-                 audio_starts) = result
-            else:
-                (audio_token_generators, requests_ids,
-                 speaker_embeddings,
-                 gpt_like_decoder_conditioning) = result
+            (audio_token_generators, requests_ids,
+             speaker_embeddings,
+             gpt_like_decoder_conditioning) = \
+                await input_request.context_partial_function(input_request)
         else:
             audio_token_generators, speaker_embeddings, gpt_like_decoder_conditioning = None, None, None
 
             if conditioning_config.speaker_embeddings and conditioning_config.gpt_like_decoder_conditioning:
-                result = await self.tts_engine.get_generation_context(input_request)
-                if len(result) == 5:
-                    (audio_token_generators, requests_ids,
-                     speaker_embeddings,
-                     gpt_like_decoder_conditioning,
-                     audio_starts) = result
-                else:
-                    (audio_token_generators, requests_ids,
-                     speaker_embeddings,
-                     gpt_like_decoder_conditioning) = result
+                (audio_token_generators, requests_ids,
+                 speaker_embeddings,
+                 gpt_like_decoder_conditioning) = await self.tts_engine.get_generation_context(input_request)
             elif conditioning_config.speaker_embeddings:
                 (audio_token_generators, requests_ids,
                  speaker_embeddings) = await self.tts_engine.get_generation_context(input_request)
@@ -152,12 +135,6 @@ class TTS:
                  gpt_like_decoder_conditioning) = await self.tts_engine.get_generation_context(input_request)
             else:
                 audio_token_generators, requests_ids = await self.tts_engine.get_generation_context(input_request)
-
-        # Ensure audio_starts exists and matches the number of generators. Engines
-        # that do not use V1 hidden-state extraction (value is always 0) remain
-        # fully compatible via this zero-fill fallback.
-        if audio_starts is None:
-            audio_starts = [0] * len(audio_token_generators)
 
         parallel_inputs = [
             {
@@ -170,7 +147,6 @@ class TTS:
                 gpt_like_decoder_conditioning is not None and isinstance(gpt_like_decoder_conditioning, list) else
                 gpt_like_decoder_conditioning if gpt_like_decoder_conditioning is not None else
                 None,
-                'audio_start': audio_starts[i],
                 'request': input_request,
             }
             for i, gen in enumerate(audio_token_generators)
@@ -198,7 +174,6 @@ class TTS:
                     generator=gen_input['generator'],
                     speaker_embeddings=gen_input['speaker_embedding'],
                     multimodal_data=gen_input['multimodal_data'],
-                    audio_start=gen_input['audio_start'],
                     request=gen_input['request'],
             ):
                 yield chunk
