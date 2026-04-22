@@ -129,6 +129,8 @@ playwright/
 .idea/
 *.iml
 .agents/
+audit_report.md
+vllm_migration_plan.md
 
 # Editor backup files
 *~
