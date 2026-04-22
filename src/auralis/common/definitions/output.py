@@ -10,10 +10,11 @@ from IPython.display import Audio, display
 import numpy as np
 import torch
 import torchaudio
-try:
-    from torchaudio.io import CodecConfig
-except ImportError:
-    from torio.io import CodecConfig
+# NOTE: torchaudio 2.9+ dropped `torchaudio.io.CodecConfig` when encoding was
+# migrated to TorchCodec. `torchaudio.save` (= `save_with_torchcodec`) now
+# accepts `compression` directly as an int/float that maps to the codec's
+# native compression level / bit rate. See
+# https://docs.pytorch.org/audio/main/torchaudio.html
 
 
 @dataclass
@@ -141,39 +142,54 @@ class TTSOutput:
 
         buffer = io.BytesIO()
 
-        if format in ['wav', 'flac']:
+        if format == 'wav':
+            # WAV is uncompressed; do not pass `compression`.
             torchaudio.save(
                 buffer,
                 wav_tensor,
                 self.sample_rate,
                 format=format,
-                encoding="PCM_S" if sample_width == 2 else "PCM_F",
-                bits_per_sample=sample_width * 8,
-                compression = CodecConfig(compression_level=min(8, self.compression)) if format == 'flac' else None
+            )
+        elif format == 'flac':
+            # FLAC compression level: integer 0..8 (higher = smaller file).
+            torchaudio.save(
+                buffer,
+                wav_tensor,
+                self.sample_rate,
+                format=format,
+                compression=min(8, self.compression),
             )
         elif format == 'mp3':
+            # MP3 compression -> bit rate in kbps (float).
             torchaudio.save(
                 buffer,
                 wav_tensor,
                 self.sample_rate,
                 format="mp3",
-                compression = CodecConfig(bit_rate=self.bit_rate)
+                compression=float(self.bit_rate),
             )
         elif format == 'opus':
+            # Opus compression level: float -1.0..10.0.
             torchaudio.save(
                 buffer,
                 wav_tensor,
                 self.sample_rate,
                 format="opus",
-                compression = CodecConfig(compression_level=self.compression)
+                compression=float(self.compression),
             )
         elif format == 'aac':
+            # torchaudio 2.10 proxies encoding to TorchCodec (FFmpeg). The
+            # TorchCodec-standard format identifier is "aac"; the legacy
+            # FFmpeg "adts" muxer name was used by torchaudio <=2.5.
+            # If AAC encoding is not supported in your TorchCodec build,
+            # fall back to MP3:
+            #     format="mp3", compression=float(self.bit_rate)
             torchaudio.save(
                 buffer,
                 wav_tensor,
                 self.sample_rate,
-                format="adts",
-                compression = CodecConfig(bit_rate=self.bit_rate)
+                format="aac",
+                compression=float(self.bit_rate),
             )
         elif format == 'pcm':
             # Scale to appropriate range based on sample width
@@ -215,13 +231,14 @@ class TTSOutput:
             sample_rate = self.sample_rate
         if wav_tensor.dtype != torch.float32:
             wav_tensor = wav_tensor.to(torch.float32)
+        # torchaudio 2.9+ `save_with_torchcodec` no longer accepts
+        # `bits_per_sample`; `channels_first` expects a bool.
         torchaudio.save(
             filename,
             wav_tensor,
             sample_rate,
             format=format,
-            bits_per_sample=self.bit_depth,
-            channels_first=self.channel
+            channels_first=bool(self.channel),
         )
 
     def resample(self, new_sample_rate: int) -> 'TTSOutput':

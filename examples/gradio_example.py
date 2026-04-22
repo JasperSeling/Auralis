@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import tempfile
 import time
 import uuid
 import shutil
@@ -27,9 +28,9 @@ try:
 except Exception as e:
     logger.error(f"Failed to load model: {e}. Ensure that the model exists at {model_path}")
 
-# Create a temporary directory to store short-named files
-temp_dir = Path("/tmp/auralis")
-temp_dir.mkdir(exist_ok=True)
+# Create a temporary directory to store short-named files (cross-platform).
+temp_dir = Path(tempfile.gettempdir()) / "auralis"
+temp_dir.mkdir(parents=True, exist_ok=True)
 
 def shorten_filename(original_path: str) -> str:
     """Copies the given file to a temporary directory with a shorter, random filename."""
