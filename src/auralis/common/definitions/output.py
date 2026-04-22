@@ -10,7 +10,7 @@ from IPython.display import Audio, display
 import numpy as np
 import torch
 import torchaudio
-from torio.io import CodecConfig
+from torchaudio.io import CodecConfig
 
 
 @dataclass
