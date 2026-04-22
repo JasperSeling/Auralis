@@ -128,7 +128,7 @@ class TwoPhaseScheduler:
             request (QueuedRequest): Request to process.
         """
         try:
-            self.logger.info(f"Starting request {request.id}")
+            self.logger.debug(f"Starting request {request.id}")
             # Phase 1: Initial processing
             await self._handle_first_phase(request)
 
@@ -137,7 +137,7 @@ class TwoPhaseScheduler:
 
             if not request.error:
                 request.state = TaskState.COMPLETED
-                self.logger.info(f"Request {request.id} completed")
+                self.logger.debug(f"Request {request.id} completed")
 
         except Exception as e:
             request.error = e

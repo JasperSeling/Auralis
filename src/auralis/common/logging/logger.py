@@ -40,6 +40,12 @@ class VLLMLogOverrider:
             r"Avg prompt throughput:.+tokens/s,.+GPU KV cache usage:.+CPU KV cache usage:.+"
         )
         self.pipeline_warning_pattern = re.compile(r"Your model uses the legacy input pipeline instead of the new")
+        # Drop vLLM per-request scheduler spam (one line per chunk).
+        # These are INFO-level messages emitted by vllm.engine.async_llm_engine
+        # and vllm.core.scheduler for every request lifecycle transition.
+        self.request_spam_pattern = re.compile(
+            r"^(Added|Finished|Aborted|Received)\s+request\s+"
+        )
         self._override_vllm_loggers()
 
     def _override_vllm_loggers(self):
@@ -67,11 +73,12 @@ class VLLMLogOverrider:
         """
 
         class RedirectHandler(logging.Handler):
-            def __init__(self, target_logger, perf_pattern, pipe_warn):
+            def __init__(self, target_logger, perf_pattern, pipe_warn, request_spam):
                 super().__init__()
                 self.target_logger = target_logger
                 self.pipe_warn = pipe_warn
                 self.perf_pattern = perf_pattern
+                self.request_spam = request_spam
 
             def emit(self, record):
                 msg = str(record.msg)
@@ -84,11 +91,20 @@ class VLLMLogOverrider:
                 elif self.pipe_warn.search(msg):
                     # Skip pipeline warning logs
                     pass
+                elif record.levelno <= logging.INFO and self.request_spam.search(msg):
+                    # Drop per-request scheduler spam (Added/Finished/Aborted request X).
+                    # Only at INFO level — WARNING/ERROR about requests still pass through.
+                    pass
                 else:
                     # Pass through all other logs normally
                     self.target_logger.log(record.levelno, msg)
 
-        return RedirectHandler(self.target_logger, self.perf_pattern, self.pipeline_warning_pattern)
+        return RedirectHandler(
+            self.target_logger,
+            self.perf_pattern,
+            self.pipeline_warning_pattern,
+            self.request_spam_pattern,
+        )
 
 
 class ColoredFormatter(logging.Formatter):
@@ -254,6 +270,11 @@ def setup_logger(
     # Get or create logger
     logger = logging.getLogger(name)
     logger.setLevel(level)
+
+    # Disable propagation to root logger to prevent duplicate output.
+    # Without this, every log line appears twice in environments where the
+    # root logger has a default handler (e.g., Colab, Jupyter, `logging.basicConfig`).
+    logger.propagate = False
 
     # Only add handler if none exists
     if not logger.handlers:
