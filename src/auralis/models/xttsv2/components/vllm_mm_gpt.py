@@ -15,7 +15,7 @@ from __future__ import annotations
 import functools
 import random
 from collections.abc import Iterable, Mapping, Sequence
-from typing import ClassVar, Literal, Optional, Union
+from typing import Any, ClassVar, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -491,14 +491,18 @@ class XttsGPT(nn.Module, SupportsMultiModal, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: Any = None,  # ABI-compat: V1 GPUModelRunner still passes this positionally.
     ) -> Optional[torch.Tensor]:
         """Project hidden states to mel-token logits.
 
         In vLLM V1 the engine's ``GPUModelRunner`` selects the hidden states
         of the last position(s) *before* calling this method and performs all
         sampling-time logits processing externally (see
-        ``vllm.v1.sample.logits_processor``). Consequently the model-side
-        ``LogitsProcessor`` helper is invoked with ``sampling_metadata=None``
+        ``vllm.v1.sample.logits_processor``). The ``sampling_metadata``
+        argument is kept as an ABI-compat shim — V1 still invokes this
+        method positionally and passes ``None`` (or an internal object we
+        intentionally do not depend on). The model-side ``LogitsProcessor``
+        helper is therefore always called with ``sampling_metadata=None``
         and only performs the vocabulary projection.
         """
         hidden_states = self.final_norm(hidden_states)
