@@ -36,7 +36,6 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -492,11 +491,19 @@ class XttsGPT(nn.Module, SupportsMultiModal, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        """Project hidden states to mel-token logits.
+
+        In vLLM V1 the engine's ``GPUModelRunner`` selects the hidden states
+        of the last position(s) *before* calling this method and performs all
+        sampling-time logits processing externally (see
+        ``vllm.v1.sample.logits_processor``). Consequently the model-side
+        ``LogitsProcessor`` helper is invoked with ``sampling_metadata=None``
+        and only performs the vocabulary projection.
+        """
         hidden_states = self.final_norm(hidden_states)
         logits = self.logits_processor(
-            self.mel_head, hidden_states, sampling_metadata, self.mel_head.bias
+            self.mel_head, hidden_states, None, self.mel_head.bias
         )
         return logits
 
