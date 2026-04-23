@@ -18,7 +18,7 @@ from rich.progress import (
     Progress,
     SpinnerColumn,
     TextColumn,
-    TimeRemainingColumn,
+    TimeElapsedColumn,
 )
 
 from auralis.common.logging.logger import setup_logger, set_vllm_logging_level
@@ -334,7 +334,7 @@ class TTS:
     @staticmethod
     @contextmanager
     def _progress_context(
-        total_subrequests: int,
+        total_subrequests: Optional[int],
         description: str,
         print_summary: bool = True,
         enabled: bool = True,
@@ -358,12 +358,19 @@ class TTS:
         ``rich.errors.LiveError``.
 
         This helper does not affect generation semantics — it only wires
-        display callbacks. Passing ``total_subrequests`` from ``len(requests)``
-        is an approximation of chunk count (XTTSv2 typically yields 1 audio
-        chunk per sub-request at EOS); rich tolerates overshoot gracefully.
+        display callbacks.
+
+        When ``total_subrequests`` is None (recommended), rich renders an
+        **indeterminate** pulse bar and the MofN column shows only the
+        completed count. Callers should prefer None over a crude estimate:
+        previously we passed ``len(split_requests(request))`` which counts
+        100k-char chunks of input text, not audio chunks (XTTSv2 yields one
+        audio chunk per sentence — typically hundreds per sub-request). This
+        produced misleading ``604/2`` displays.
 
         Args:
-            total_subrequests (int): Expected chunk count (upper-bar total).
+            total_subrequests (Optional[int]): Total chunk count if known,
+                otherwise None for an indeterminate bar.
             description (str): Short label shown next to the spinner.
             print_summary (bool): Whether to print the default summary line
                 after the Progress bar closes. Defaults to True.
@@ -388,8 +395,7 @@ class TTS:
             BarColumn(),
             MofNCompleteColumn(),
             TextColumn("чанков | [yellow]{task.fields[rate]} tok/s"),
-            TextColumn("| осталось"),
-            TimeRemainingColumn(),
+            TimeElapsedColumn(),
             transient=True,
             console=_console,
         ) as progress:
@@ -459,7 +465,7 @@ class TTS:
             # Streaming case
             def streaming_wrapper():
                 with self._progress_context(
-                    len(requests), description, enabled=_show_progress
+                    None, description, enabled=_show_progress
                 ) as advance:
                     for sub_request in requests:
                         # For streaming, execute the async gen
@@ -490,7 +496,7 @@ class TTS:
         else:
             # Non streaming
             with self._progress_context(
-                len(requests), description, enabled=_show_progress
+                None, description, enabled=_show_progress
             ) as advance:
                 result = self.loop.run_until_complete(
                     self._process_multiple_requests(requests, on_chunk=advance)
@@ -629,7 +635,6 @@ class TTS:
         """
         filename = str(filename)
         fmt = self._resolve_format(filename, format)
-        total_hint = len(self.split_requests(request))
         description = self._make_progress_description(request)
 
         # KAMEN 1 — мутируем stream локально, restore в finally.
@@ -642,8 +647,12 @@ class TTS:
 
         try:
             if progress:
+                # total=None — indeterminate bar: actual chunk count is only
+                # known after generation (one chunk per sentence, typically
+                # hundreds). Using len(split_requests) would display misleading
+                # "604/2" counters.
                 with self._progress_context(
-                    total_hint, description, print_summary=False
+                    None, description, print_summary=False
                 ) as advance:
                     # _show_progress=False prevents generate_speech from
                     # opening a nested rich.Live on the same _console — rich
@@ -698,7 +707,6 @@ class TTS:
         """
         filename = str(filename)
         fmt = self._resolve_format(filename, format)
-        total_hint = len(self.split_requests(request))
         description = self._make_progress_description(request)
 
         original_stream = request.stream
@@ -710,7 +718,7 @@ class TTS:
             gen = await self.generate_speech_async(request)
             if progress:
                 with self._progress_context(
-                    total_hint, description, print_summary=False
+                    None, description, print_summary=False
                 ) as advance:
                     async for chunk in gen:
                         writer.write(chunk)

@@ -85,6 +85,13 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         self.request_counter = Counter()
 
         self.max_concurrency = kwargs.pop('max_concurrency', 10)
+        # User-supplied GPU memory utilization override. When None (default),
+        # init_vllm_engine falls back to the empirical polynomial derived from
+        # max_concurrency via get_memory_usage_curve(). Exposed so callers can
+        # force a higher utilization (e.g. 0.95) to reduce KV-cache preemption
+        # on memory-constrained GPUs like T4, where the default can leave too
+        # little headroom for the KV-cache of parallel sequences.
+        self.gpu_memory_utilization: Optional[float] = kwargs.pop('gpu_memory_utilization', None)
         semaphore_concurrency = max(1,self.max_concurrency // 6) * self.tp
 
         # Register buffer before creating modules
@@ -200,13 +207,26 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             concurrency (int): Maximum number of concurrent requests to handle.
 
         Raises:
-            RuntimeError: If unable to determine memory usage for model initialization.
+            RuntimeError: If unable to determine memory usage for model initialization
+                and no explicit ``gpu_memory_utilization`` override was supplied.
         """
-        """Initialize models with AsyncVLLMEngine."""
         max_seq_num = concurrency
-        mem_utils = self.get_memory_percentage(self.max_gb_for_vllm_model * 1024 ** 3) #
-        if not mem_utils:
-            raise RuntimeError("Could not find the memory usage for the VLLM model initialization.")
+        if self.gpu_memory_utilization is not None:
+            # User-supplied override (see __init__). Skip the polynomial
+            # estimator entirely — the caller knows what they want (e.g. 0.95
+            # on a T4 to avoid RECOMPUTE-mode KV-cache preemption).
+            mem_utils = self.gpu_memory_utilization
+            self.logger.info(
+                f"Using user-supplied gpu_memory_utilization={mem_utils:.2f}"
+            )
+        else:
+            mem_utils = self.get_memory_percentage(self.max_gb_for_vllm_model * 1024 ** 3)
+            if not mem_utils:
+                raise RuntimeError(
+                    "Could not estimate gpu_memory_utilization for vLLM init. "
+                    "Pass gpu_memory_utilization=<float> to TTS.from_pretrained "
+                    "to override (recommended on memory-constrained GPUs)."
+                )
         engine_args = AsyncEngineArgs(
             model=self.gpt_model,
             tensor_parallel_size=self.tp,
