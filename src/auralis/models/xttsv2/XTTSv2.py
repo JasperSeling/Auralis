@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, AsyncGenerator
-from concurrent.futures import ThreadPoolExecutor
 
 import librosa
 import numpy as np
@@ -842,6 +841,20 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                         start_time = request.start_time,
                                         token_length = len(output.outputs[0].token_ids)
                                         )
+
+                # Free vLLM-internal metadata for the finished request now
+                # instead of waiting for the caller to release the generator.
+                # Every pending request keeps its SequenceGroup, multi-modal
+                # data (audio embeds), token_ids history and our sampling
+                # params alive — ~1 MB per sentence. On a 900-sentence job
+                # that is ~900 MB of avoidable RSS growth. abort() is a
+                # no-op for already-cleaned requests in vLLM 0.6.x.
+                try:
+                    await self.llm_engine.abort(output.request_id)
+                except Exception as e:  # best-effort — do not break streaming
+                    self.logger.debug(
+                        f"llm_engine.abort({output.request_id}) failed: {e}"
+                    )
 
 
 

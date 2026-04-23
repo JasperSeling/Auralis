@@ -4,7 +4,6 @@ import logging
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -743,3 +742,15 @@ class TTS:
             await self.scheduler.shutdown()
         if self.tts_engine and hasattr(self.tts_engine, 'shutdown'):
             await self.tts_engine.shutdown()
+        # Release worker threads spawned by asyncio.to_thread calls
+        # (HiFi-GAN decode, GPT conditioning). Without this the default
+        # ThreadPoolExecutor keeps ~6-8 worker threads alive until process
+        # exit — observed as a persistent +6 thread delta after long jobs.
+        # We do NOT close the loop: on Colab/Jupyter self.loop is the host
+        # notebook loop (grabbed via get_running_loop in _ensure_event_loop)
+        # and must survive TTS shutdown.
+        if self.loop and not self.loop.is_closed():
+            try:
+                await self.loop.shutdown_default_executor()
+            except Exception as e:
+                self.logger.warning(f"shutdown_default_executor failed: {e}")
