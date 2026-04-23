@@ -2,7 +2,6 @@ import threading
 from typing import Optional, Dict, List, Callable
 import torch
 from queue import Queue
-from concurrent.futures import ThreadPoolExecutor
 
 from auralis.common.logging.logger import setup_logger
 
@@ -63,7 +62,9 @@ class HiddenStatesCollector:
         self.states_count: Dict[str, int] = {}
         self.expected_states: Dict[str, int] = {}
         self.notifications: Dict[str, Queue] = {}
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        # Note: a ThreadPoolExecutor used to be constructed here but was never
+        # submitted to. It has been removed — creating one per instance was a
+        # resource leak when callers instantiated a fresh collector per request.
 
     def initialize_request(self, request_id: str):
         """Initialize collection resources for a new request.
@@ -144,13 +145,22 @@ class HiddenStatesCollector:
                 return None
 
             # Wait for completion using threading.Event
-            if not self.collection_complete[request_id].wait(timeout):
+            completed = self.collection_complete[request_id].wait(timeout)
+            if not completed:
+                # Timeout path — we must still free per-request state, otherwise
+                # long-running engines accumulate orphaned dicts (~900 entries
+                # for a 154-min TTS job) and drift the RSS upward.
+                self._cleanup_request(request_id)
                 return None
 
             with self.locks[request_id]:
                 outputs = self.outputs.get(request_id, [])
                 if not outputs:
                     self.logger.critical(f"No hidden states found for request {request_id}") # most likely due to wrong profiling data dimensions
+                    # Cleanup before raising — the exception propagates out of
+                    # the outer try; ValueError is caught by the outer handler
+                    # which returns None. Without cleanup the dicts leak.
+                    self._cleanup_request(request_id)
                     raise ValueError(f"No hidden states found for request {request_id}, "
                                      f"this should not happen, please open an issue on github")
 
@@ -160,10 +170,13 @@ class HiddenStatesCollector:
                     return result
                 except Exception as e:
                     self.logger.error(f"Error processing hidden states: {e}")
+                    self._cleanup_request(request_id)
                     raise
 
         except Exception as e:
             self.logger.error(f"Error retrieving hidden states: {e}")
+            # Best-effort cleanup on any unexpected error path.
+            self._cleanup_request(request_id)
             return None
 
     def _cleanup_request(self, request_id: str):
@@ -184,6 +197,28 @@ class HiddenStatesCollector:
             self.expected_states.pop(request_id, None)
             self.notifications.pop(request_id, None)
             self.logger.debug(f"Cleaned up request {request_id}")
+
+    def shutdown(self) -> None:
+        """Release all per-request state held by this collector.
+
+        Safe to call multiple times. Intended to be invoked from the engine's
+        shutdown() method to guarantee that tensors captured via ``sync_collect``
+        (kept alive by vLLM's references to our ``SyncCollectorWrapper``) are
+        released promptly instead of waiting for process exit.
+        """
+        with self.global_lock:
+            for request_id in list(self.outputs.keys()):
+                # Drop references without re-acquiring the per-request lock:
+                # shutdown implies no further sync_collect/get_hidden_states
+                # calls are expected.
+                self.outputs.pop(request_id, None)
+                self.collection_ready.pop(request_id, None)
+                self.collection_complete.pop(request_id, None)
+                self.locks.pop(request_id, None)
+                self.states_count.pop(request_id, None)
+                self.expected_states.pop(request_id, None)
+                self.notifications.pop(request_id, None)
+            self.logger.debug("HiddenStatesCollector shutdown: released all per-request state")
 
     def bind_to_request(self, request_id: str) -> SyncCollectorWrapper:
         """Create a synchronous collector wrapper for a request.

@@ -154,6 +154,17 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         # Semaphore for concurrency control of the encoding process
         self.encoder_semaphore = asyncio.BoundedSemaphore(semaphore_concurrency)
         self.decoder_semaphore = asyncio.BoundedSemaphore(semaphore_concurrency) # empirically found a good value
+
+        # Single HiddenStatesCollector shared across every get_model_logits call.
+        # Previously a fresh instance was constructed per sentence (per-request);
+        # because vLLM retains our SyncCollectorWrapper via sampling_params for
+        # the lifetime of the finished RequestOutput, each of those collectors
+        # stayed pinned in memory — contributing ~1GB RSS growth over a 900-
+        # sentence job. The class was already designed to be multi-request
+        # thread-safe (per-request dicts keyed by request_id), so one instance
+        # is the intended usage. See components/vllm/hidden_state_collector.py.
+        self.hidden_states_collector = HiddenStatesCollector()
+
         self.eval()
 
     def get_memory_usage_curve(self):
@@ -668,9 +679,10 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
 
         engine_inputs["multi_modal_data"] = conditioning
 
-        hidden_states_collector = HiddenStatesCollector()
-        # Bind the collector to this request
-        bound_collector = hidden_states_collector.bind_to_request(request_id)
+        # Reuse the engine-wide collector. bind_to_request installs fresh
+        # per-request state within the shared instance so concurrent calls
+        # remain isolated.
+        bound_collector = self.hidden_states_collector.bind_to_request(request_id)
 
         # Set up sampling parameters with the bound collector
         sampling_params = ExtendedSamplingParams(
@@ -693,7 +705,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                 pass
 
         # Get the collected hidden states
-        hidden_states = await hidden_states_collector.get_hidden_states(request_id)
+        hidden_states = await self.hidden_states_collector.get_hidden_states(request_id)
 
         if hidden_states is None:
             raise RuntimeError(
@@ -834,5 +846,11 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
 
 
     async def shutdown(self):
+        # Drop any lingering per-request state the collector may still hold
+        # (tensors pinned by vLLM's references to our SyncCollectorWrapper).
+        try:
+            self.hidden_states_collector.shutdown()
+        except Exception as e:  # defensive — do not block engine shutdown
+            self.logger.warning(f"HiddenStatesCollector shutdown failed: {e}")
         self.llm_engine.shutdown_background_loop()
 
