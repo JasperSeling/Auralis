@@ -51,6 +51,7 @@ setup(
         "pyloudnorm",
         "pytest",
         "pypinyin",
+        "rich",
         "safetensors",
         "sounddevice",
         "soundfile",

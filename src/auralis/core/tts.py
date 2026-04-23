@@ -337,6 +337,7 @@ class TTS:
         total_subrequests: int,
         description: str,
         print_summary: bool = True,
+        enabled: bool = True,
     ):
         """Yield a rich Progress advance-callback; optionally print summary on exit.
 
@@ -349,6 +350,13 @@ class TTS:
         ``save_stream`` which prints its own file-oriented summary), the caller
         is responsible for any post-generation output.
 
+        When ``enabled`` is False, the helper yields a no-op ``advance`` and
+        does not create a ``Progress`` / ``Live`` at all. This is required when
+        a caller already owns an active Live on ``_console`` (for example
+        ``save_stream`` invokes ``generate_speech`` internally) — rich forbids
+        two simultaneous Live displays on the same console and would raise
+        ``rich.errors.LiveError``.
+
         This helper does not affect generation semantics — it only wires
         display callbacks. Passing ``total_subrequests`` from ``len(requests)``
         is an approximation of chunk count (XTTSv2 typically yields 1 audio
@@ -359,10 +367,18 @@ class TTS:
             description (str): Short label shown next to the spinner.
             print_summary (bool): Whether to print the default summary line
                 after the Progress bar closes. Defaults to True.
+            enabled (bool): When False, skip the Progress display entirely
+                and yield a no-op advance. Defaults to True.
 
         Yields:
             Callable[[TTSOutput], None]: The ``advance`` callback.
         """
+        if not enabled:
+            # Early-return path: no Progress, no Live, no summary. Used when
+            # an outer caller already owns the rich.Live on _console.
+            yield lambda _chunk: None
+            return
+
         start_time = time.time()
         chunks_seen: List[TTSOutput] = []
 
@@ -414,11 +430,20 @@ class TTS:
         flat = " ".join(text.split())
         return flat[:40] + ("…" if len(flat) > 40 else "")
 
-    def generate_speech(self, request: TTSRequest) -> Union[Generator[TTSOutput, None, None], TTSOutput]:
+    def generate_speech(
+        self,
+        request: TTSRequest,
+        _show_progress: bool = True,
+    ) -> Union[Generator[TTSOutput, None, None], TTSOutput]:
         """Generate speech synchronously from text.
 
         Args:
             request (TTSRequest): The TTS request to process.
+            _show_progress (bool): Internal flag. When False, suppresses the
+                rich.Progress display managed by ``_progress_context``. Used by
+                ``save_stream`` so its outer Progress bar is the only active
+                Live on the console — rich forbids nested Live displays.
+                Leading underscore signals "not part of the stable public API".
 
         Returns:
             Union[Generator[TTSOutput, None, None], TTSOutput]: Audio output, either streamed or complete.
@@ -433,7 +458,9 @@ class TTS:
         if request.stream:
             # Streaming case
             def streaming_wrapper():
-                with self._progress_context(len(requests), description) as advance:
+                with self._progress_context(
+                    len(requests), description, enabled=_show_progress
+                ) as advance:
                     for sub_request in requests:
                         # For streaming, execute the async gen
                         async def process_stream():
@@ -462,7 +489,9 @@ class TTS:
             return streaming_wrapper()
         else:
             # Non streaming
-            with self._progress_context(len(requests), description) as advance:
+            with self._progress_context(
+                len(requests), description, enabled=_show_progress
+            ) as advance:
                 result = self.loop.run_until_complete(
                     self._process_multiple_requests(requests, on_chunk=advance)
                 )
@@ -616,11 +645,14 @@ class TTS:
                 with self._progress_context(
                     total_hint, description, print_summary=False
                 ) as advance:
-                    for chunk in self.generate_speech(request):
+                    # _show_progress=False prevents generate_speech from
+                    # opening a nested rich.Live on the same _console — rich
+                    # disallows nested Live displays (LiveError otherwise).
+                    for chunk in self.generate_speech(request, _show_progress=False):
                         writer.write(chunk)
                         advance(chunk)
             else:
-                for chunk in self.generate_speech(request):
+                for chunk in self.generate_speech(request, _show_progress=False):
                     writer.write(chunk)
         finally:
             request.stream = original_stream
