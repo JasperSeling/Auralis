@@ -716,6 +716,57 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         return self.final_norm(hidden_states[start_of_audio_hs:-5, ...].unsqueeze(0).to(self.device).to(self.dtype))
 
 
+    async def _make_sentence_generator(
+        self,
+        sequence: List[int],
+        request: TTSRequest,
+        gpt_embed_inputs: Optional[List[torch.Tensor]],
+        seq_index: int,
+        request_id: str,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Deferred per-sentence vLLM generator.
+
+        An ``async def`` with ``yield`` produces an *unstarted* async generator
+        — the body does not run until the first ``__anext__`` call. This lets
+        us avoid allocating the per-sentence heavy objects (``ExtendedSampling
+        Params`` with its ``LogitsRepetitionPenalizer``, the ``TokensPrompt``
+        dict, and the vLLM request registration inside ``llm_engine.generate``)
+        until the :class:`TwoPhaseScheduler` actually starts pumping this
+        particular sentence — i.e. after it has acquired ``second_phase_sem``.
+        At any moment only ~``second_phase_concurrency`` (typically ~10)
+        sentences hold these objects, rather than all ``len(tokens_list)``
+        (~900 on long inputs), which was the root cause of the ~1 GB RSS
+        growth observed on 154-minute jobs.
+        """
+        sampling_params = ExtendedSamplingParams(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            detokenize=False,
+            request_id=request_id,
+            top_k=request.top_k,
+            logits_processors=[LogitsRepetitionPenalizer(request.repetition_penalty)],
+            repetition_penalty=1.0,  # handled manually by the logits processor above
+            max_tokens=self.gpt_config.gpt_max_audio_tokens,
+            ignore_eos=True,  # tokenizer eos is for text, not audio tokens
+            stop_token_ids=[self.mel_eos_token_id],
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        engine_inputs = TokensPrompt(prompt_token_ids=sequence)
+        if gpt_embed_inputs is not None:
+            engine_inputs["multi_modal_data"] = {
+                "audio": {
+                    "embeds": gpt_embed_inputs[seq_index],
+                    "is_logits_only_mode": False,
+                    "sequence_length": len(sequence),
+                }
+            }
+        async for output in self.llm_engine.generate(
+            prompt=engine_inputs,
+            sampling_params=sampling_params,
+            request_id=request_id,
+        ):
+            yield output
+
     @torch.inference_mode()
     async def get_generation_context(self,
                                      request: TTSRequest,
@@ -749,41 +800,25 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                                                                 split_text=True)
             gpt_embed_inputs = await self._merge_conditioning(text_embeddings, gpt_cond_latent)
 
-        # Start all requests in parallel
+        # Build an *unstarted* async generator per sentence. The vLLM
+        # request, ExtendedSamplingParams and TokensPrompt are materialised
+        # lazily inside _make_sentence_generator (see its docstring), so at
+        # any moment only ~second_phase_concurrency of them exist — not all
+        # len(tokens_list). The requests_id list is still populated eagerly
+        # because callers (and the collector) need stable ids up front.
         generators = []
         requests_id = []
         for seq_index, sequence in enumerate(tokens_list):
-            sampling_params = ExtendedSamplingParams(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                detokenize=False,
-                request_id=uuid.uuid4(),
-                top_k=request.top_k,
-                logits_processors=[LogitsRepetitionPenalizer(request.repetition_penalty)],
-                repetition_penalty=1.0,  # Since we're handling repetition penalty manually
-                max_tokens=self.gpt_config.gpt_max_audio_tokens,
-                ignore_eos=True,  # Ignore the tokenizer eos token since it is for textual generation
-                stop_token_ids=[self.mel_eos_token_id],
-                output_kind=RequestOutputKind.FINAL_ONLY
+            request_id = f"{request.request_id}_{seq_index}"
+            generators.append(
+                self._make_sentence_generator(
+                    sequence=sequence,
+                    request=request,
+                    gpt_embed_inputs=gpt_embed_inputs,
+                    seq_index=seq_index,
+                    request_id=request_id,
+                )
             )
-
-            engine_inputs = TokensPrompt(prompt_token_ids=sequence)
-            if gpt_embed_inputs is not None:
-                engine_inputs["multi_modal_data"] = {
-                    "audio": {
-                        "embeds": gpt_embed_inputs[seq_index],
-                        "is_logits_only_mode": False,
-                        "sequence_length": len(sequence)
-                    }
-                }
-            request_id =f"{request.request_id}_{seq_index}"
-            # Get audio token generator from VLLM
-            token_generator = self.llm_engine.generate(
-                prompt=engine_inputs,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            )
-            generators.append(token_generator)
             requests_id.append(request_id)
 
         return generators, requests_id, speaker_embeddings, gpt_embed_inputs
@@ -842,19 +877,13 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                         token_length = len(output.outputs[0].token_ids)
                                         )
 
-                # Free vLLM-internal metadata for the finished request now
-                # instead of waiting for the caller to release the generator.
-                # Every pending request keeps its SequenceGroup, multi-modal
-                # data (audio embeds), token_ids history and our sampling
-                # params alive — ~1 MB per sentence. On a 900-sentence job
-                # that is ~900 MB of avoidable RSS growth. abort() is a
-                # no-op for already-cleaned requests in vLLM 0.6.x.
-                try:
-                    await self.llm_engine.abort(output.request_id)
-                except Exception as e:  # best-effort — do not break streaming
-                    self.logger.debug(
-                        f"llm_engine.abort({output.request_id}) failed: {e}"
-                    )
+                # Note: llm_engine.abort(output.request_id) used to live here
+                # as a workaround for eager submission of all N sentences up
+                # front. With the lazy _make_sentence_generator path the
+                # request is scoped to this async-for frame and released by GC
+                # as soon as the generator exits — abort() is redundant and
+                # measurably slowed RTF (0.071 -> 0.083). Kept as a comment
+                # so future readers do not re-add it.
 
 
 
