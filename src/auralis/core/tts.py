@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import partial
+from pathlib import Path
 from typing import AsyncGenerator, Callable, Optional, Dict, Union, Generator, List
 
 from huggingface_hub import hf_hub_download
@@ -332,16 +333,21 @@ class TTS:
 
     @staticmethod
     @contextmanager
-    def _progress_context(total_subrequests: int, description: str):
-        """Yield a rich Progress advance-callback; print summary on exit.
+    def _progress_context(
+        total_subrequests: int,
+        description: str,
+        print_summary: bool = True,
+    ):
+        """Yield a rich Progress advance-callback; optionally print summary on exit.
 
         The callback signature is ``advance(chunk: TTSOutput) -> None``. Each
         call advances the bar by one and updates the live ``tok/s`` field from
         the global metrics tracker.
 
-        After the ``with`` block exits (normally or via exception), a one-line
-        summary is printed to the shared console with wall-clock time, total
-        audio duration, and realtime-factor (RTF).
+        When ``print_summary`` is True (default, used by ``generate_speech``),
+        a one-line summary is printed on exit. When False (used by
+        ``save_stream`` which prints its own file-oriented summary), the caller
+        is responsible for any post-generation output.
 
         This helper does not affect generation semantics — it only wires
         display callbacks. Passing ``total_subrequests`` from ``len(requests)``
@@ -351,6 +357,8 @@ class TTS:
         Args:
             total_subrequests (int): Expected chunk count (upper-bar total).
             description (str): Short label shown next to the spinner.
+            print_summary (bool): Whether to print the default summary line
+                after the Progress bar closes. Defaults to True.
 
         Yields:
             Callable[[TTSOutput], None]: The ``advance`` callback.
@@ -377,15 +385,10 @@ class TTS:
                 rate = f"{tps:>4.0f}" if tps > 0 else "  —"
                 progress.update(task, advance=1, rate=rate)
 
-            try:
-                yield advance
-            finally:
-                # Stop the progress display before printing the summary so the
-                # transient bar doesn't overwrite the summary line.
-                pass
+            yield advance
 
         # Compute and print summary after the Progress context has torn down.
-        if chunks_seen:
+        if print_summary and chunks_seen:
             elapsed = time.time() - start_time
             sr = chunks_seen[0].sample_rate or 0
             total_samples = sum(c.array.shape[0] for c in chunks_seen)
@@ -464,6 +467,235 @@ class TTS:
                     self._process_multiple_requests(requests, on_chunk=advance)
                 )
             return result
+
+    class _StreamingFileWriter:
+        """Chunk-at-a-time audio writer backed by ``soundfile.SoundFile``.
+
+        Opens the output file lazily on the first chunk so the sample rate is
+        taken from the actual model output (not hardcoded). Tracks total
+        samples and wall-time to compute RTF/duration in ``stats()``.
+
+        This is intentionally a small helper class used by
+        ``save_stream`` / ``save_stream_async`` so the sync and async variants
+        don't duplicate the write-and-account logic.
+        """
+
+        def __init__(self, filename: str, fmt: str):
+            import soundfile as sf  # lazy: only cost for users who stream
+            self._sf_module = sf
+            self.filename = filename
+            self.fmt = fmt
+            self.sf_file = None
+            self.sr: Optional[int] = None
+            self.total_samples: int = 0
+            self.start_wall: float = time.time()
+
+        def write(self, chunk: TTSOutput) -> None:
+            if self.sf_file is None:
+                self.sr = int(chunk.sample_rate)
+                channels = 1 if chunk.array.ndim == 1 else chunk.array.shape[0]
+                self.sf_file = self._sf_module.SoundFile(
+                    self.filename,
+                    mode='w',
+                    samplerate=self.sr,
+                    channels=channels,
+                    format=self.fmt,
+                )
+            arr = chunk.array
+            # soundfile accepts float32/float64/int16/int32. TTSOutput.array is
+            # typically float32 already (XTTSv2.py:805), but guard for safety.
+            if hasattr(arr, 'dtype') and arr.dtype.kind == 'f' and arr.dtype.itemsize != 4:
+                import numpy as np  # lazy; already at module scope transitively
+                arr = arr.astype(np.float32)
+            self.sf_file.write(arr)
+            self.total_samples += arr.shape[0]
+
+        def close(self) -> None:
+            if self.sf_file is not None:
+                self.sf_file.close()
+                self.sf_file = None
+
+        def stats(self) -> dict:
+            wall = time.time() - self.start_wall
+            duration = self.total_samples / self.sr if self.sr else 0.0
+            rtf = wall / duration if duration > 0 else 0.0
+            return {
+                'path': self.filename,
+                'sample_rate': self.sr,
+                'n_samples': self.total_samples,
+                'duration_sec': duration,
+                'wall_sec': wall,
+                'rtf': rtf,
+            }
+
+    @staticmethod
+    def _resolve_format(filename: str, fmt: Optional[str]) -> str:
+        """Pick a soundfile format code from an explicit override or file extension.
+
+        Defaults to ``'WAV'`` when no extension is present. Common mappings
+        (``.wav``, ``.flac``, ``.ogg``) are passed through uppercased, which
+        matches ``soundfile``'s ``format=`` API.
+        """
+        from pathlib import Path as _Path
+        if fmt:
+            return fmt.upper()
+        suffix = _Path(filename).suffix.lstrip('.').upper()
+        return suffix or 'WAV'
+
+    def _print_stream_summary(self, stats: dict) -> None:
+        """Print the post-stream summary line via the shared rich console."""
+        duration_min = stats['duration_sec'] / 60.0
+        _console.print(
+            f"[bold green]✅ {stats['path']}[/] | "
+            f"[cyan]{duration_min:.1f} мин[/] | "
+            f"[magenta]RTF {stats['rtf']:.2f}x[/] | "
+            f"{stats['wall_sec']:.0f} сек"
+        )
+
+    def save_stream(
+        self,
+        request: TTSRequest,
+        filename: Union[str, Path],
+        format: Optional[str] = None,
+        progress: bool = True,
+    ) -> dict:
+        """Generate speech and stream-write the audio to a file chunk-by-chunk.
+
+        This is the **O(1) RAM** path: chunks are yielded by the existing
+        ``generate_speech(stream=True)`` pipeline and written to disk as they
+        arrive. The full audio is **never** held in memory — safe for
+        arbitrarily long generations (audiobooks, podcasts).
+
+        The file is opened lazily on the first chunk, with ``sample_rate``
+        taken from the actual model output. The output format is inferred
+        from the ``filename`` extension (``.wav``, ``.flac``, ``.ogg``) or
+        explicitly overridden via ``format=``.
+
+        !!! tip "Long generations"
+            For generations longer than ~10 minutes, prefer ``.flac`` —
+            it is streaming-safe and recovers gracefully from an interrupted
+            Colab runtime. WAV requires a header rewrite on close; if the
+            process is killed mid-generation the header size will be wrong
+            (though most players will still play the file up to its
+            actual end).
+
+        Args:
+            request (TTSRequest): The TTS request. Its ``stream`` flag is
+                temporarily forced to True for the duration of this call
+                and restored in a ``finally`` block regardless of outcome.
+            filename (str | Path): Target output path. Format inferred from
+                extension when ``format`` is not provided.
+            format (Optional[str]): Optional explicit ``soundfile`` format
+                code (``'WAV'``, ``'FLAC'``, ``'OGG'``, ...). Overrides
+                the extension-based guess.
+            progress (bool): Display a rich.Progress bar during generation.
+                Defaults to True. Set False for non-TTY environments.
+
+        Returns:
+            dict: Statistics with keys ``'path'``, ``'sample_rate'``,
+                ``'n_samples'``, ``'duration_sec'``, ``'wall_sec'``, ``'rtf'``.
+
+        Raises:
+            RuntimeError: If the generator yielded zero chunks.
+        """
+        filename = str(filename)
+        fmt = self._resolve_format(filename, format)
+        total_hint = len(self.split_requests(request))
+        description = self._make_progress_description(request)
+
+        # KAMEN 1 — мутируем stream локально, restore в finally.
+        # Не используем request.copy() потому что Pydantic copy может быть
+        # shallow и ссылочные поля (speaker_files) будут shared.
+        original_stream = request.stream
+        request.stream = True
+
+        writer = self._StreamingFileWriter(filename, fmt)
+
+        try:
+            if progress:
+                with self._progress_context(
+                    total_hint, description, print_summary=False
+                ) as advance:
+                    for chunk in self.generate_speech(request):
+                        writer.write(chunk)
+                        advance(chunk)
+            else:
+                for chunk in self.generate_speech(request):
+                    writer.write(chunk)
+        finally:
+            request.stream = original_stream
+            writer.close()
+
+        if writer.total_samples == 0:
+            raise RuntimeError('save_stream: generate_speech yielded zero chunks')
+
+        stats = writer.stats()
+        self._print_stream_summary(stats)
+        return stats
+
+    async def save_stream_async(
+        self,
+        request: TTSRequest,
+        filename: Union[str, Path],
+        format: Optional[str] = None,
+        progress: bool = True,
+    ) -> dict:
+        """Async variant of ``save_stream`` for callers inside an event loop.
+
+        Use this from FastAPI handlers, jupyter-async cells, or any ``async
+        def``. Internally iterates ``generate_speech_async(stream=True)`` and
+        writes each chunk to the target file without buffering the full audio
+        in RAM.
+
+        See ``save_stream`` for parameter and return semantics. The return
+        value and printed summary are identical; only the call-site concurrency
+        model differs.
+
+        Args:
+            request (TTSRequest): The TTS request. ``stream`` is forced True
+                locally and restored in ``finally``.
+            filename (str | Path): Output path.
+            format (Optional[str]): Explicit ``soundfile`` format override.
+            progress (bool): Show a rich.Progress bar during generation.
+
+        Returns:
+            dict: Same schema as ``save_stream``.
+
+        Raises:
+            RuntimeError: If the generator yielded zero chunks.
+        """
+        filename = str(filename)
+        fmt = self._resolve_format(filename, format)
+        total_hint = len(self.split_requests(request))
+        description = self._make_progress_description(request)
+
+        original_stream = request.stream
+        request.stream = True
+
+        writer = self._StreamingFileWriter(filename, fmt)
+
+        try:
+            gen = await self.generate_speech_async(request)
+            if progress:
+                with self._progress_context(
+                    total_hint, description, print_summary=False
+                ) as advance:
+                    async for chunk in gen:
+                        writer.write(chunk)
+                        advance(chunk)
+            else:
+                async for chunk in gen:
+                    writer.write(chunk)
+        finally:
+            request.stream = original_stream
+            writer.close()
+
+        if writer.total_samples == 0:
+            raise RuntimeError('save_stream_async: generate_speech_async yielded zero chunks')
+
+        stats = writer.stats()
+        self._print_stream_summary(stats)
+        return stats
 
     async def shutdown(self):
         """Shuts down the TTS engine and scheduler."""

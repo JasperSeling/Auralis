@@ -139,9 +139,12 @@ def track_generation(func: Callable[..., AsyncGenerator[T, None]]) -> Callable[.
                 audio_seconds = output.array.shape[0] / output.sample_rate
 
                 if metrics.update_metrics(output.token_length, audio_seconds):
-                    # RTF = processing-ms-per-audio-second / 1000; <1.0 means faster-than-realtime
+                    # RTF = processing-ms-per-audio-second / 1000; <1.0 means faster-than-realtime.
+                    # Emitted at DEBUG so the rich.Progress bar (driven by TTS._progress_context)
+                    # is not overwritten by log lines during interactive runs. Metrics remain
+                    # accessible via `metrics.tokens_per_second` etc., and surface via DEBUG logging.
                     rtf = metrics.ms_per_second_of_audio / 1000.0
-                    metrics.logger.info(
+                    metrics.logger.debug(
                         f"🔊 {metrics.tokens_per_second:>5.0f} tok/s | "
                         f"{metrics.requests_per_second:>4.1f} req/s | "
                         f"RTF {rtf:.2f}x"
