@@ -7,6 +7,9 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 
 from .......common.utilities import load_fsspec
+from .......common.logging.logger import setup_logger
+
+logger = setup_logger(__file__)
 
 LRELU_SLOPE = 0.1
 
@@ -277,7 +280,7 @@ class HifiganGenerator(torch.nn.Module):
         return self.forward(c)
 
     def remove_weight_norm(self):
-        print("Removing weight norm...")
+        logger.info("Removing weight norm...")
         for l in self.ups:
             remove_parametrizations(l, "weight")
         for l in self.resblocks:
@@ -435,7 +438,7 @@ def set_init_dict(model_dict, checkpoint_state, c):
     # Partial initialization: if there is a mismatch with new and old layer, it is skipped.
     for k, v in checkpoint_state.items():
         if k not in model_dict:
-            print(f" | > Layer missing in the model definition: {k}")
+            logger.info(f" | > Layer missing in the model definition: {k}")
     pretrained_dict = {k: v for k, v in checkpoint_state.items() if k in model_dict}
     # 2. filter out different size layers
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if v.numel() == model_dict[k].numel()}
@@ -445,7 +448,7 @@ def set_init_dict(model_dict, checkpoint_state, c):
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if reinit_layer_name not in k}
     # 4. overwrite entries in the existing state dict
     model_dict.update(pretrained_dict)
-    print(f" | > {len(pretrained_dict)} / {len(model_dict)} layers are restored.")
+    logger.info(f" | > {len(pretrained_dict)} / {len(model_dict)} layers are restored.")
     return model_dict
 
 
@@ -656,13 +659,13 @@ class ResNetSpeakerEncoder(nn.Module):
         state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"), cache=cache)
         try:
             self.load_state_dict(state["model"])
-            print(" > Model fully restored. ")
+            logger.info(" > Model fully restored. ")
         except (KeyError, RuntimeError) as error:
             # If eval raise the error
             if eval:
                 raise error
 
-            print(" > Partial model initialization.")
+            logger.info(" > Partial model initialization.")
             model_dict = self.state_dict()
             model_dict = set_init_dict(model_dict, state["model"])
             self.load_state_dict(model_dict)
@@ -673,7 +676,7 @@ class ResNetSpeakerEncoder(nn.Module):
             try:
                 criterion.load_state_dict(state["criterion"])
             except (KeyError, RuntimeError) as error:
-                print(" > Criterion load ignored because of:", error)
+                logger.warning(f" > Criterion load ignored because of: {error}")
 
         if use_cuda:
             self.cuda()

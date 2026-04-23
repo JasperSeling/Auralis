@@ -5,17 +5,31 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import partial
-from typing import AsyncGenerator, Optional, Dict, Union, Generator, List
+from typing import AsyncGenerator, Callable, Optional, Dict, Union, Generator, List
 
 from huggingface_hub import hf_hub_download
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from auralis.common.logging.logger import setup_logger, set_vllm_logging_level
 from auralis.common.definitions.output import TTSOutput
 from auralis.common.definitions.requests import TTSRequest
-from auralis.common.metrics.performance import track_generation
+from auralis.common.metrics.performance import metrics, track_generation
 from auralis.common.scheduling.two_phase_scheduler import TwoPhaseScheduler
 from auralis.models.base import BaseAsyncTTSEngine, AudioOutputGenerator
+
+# Shared rich console for progress display and summaries.
+# Module-level so it reuses the same Terminal handle across calls.
+_console = Console()
 
 class TTS:
     """A high-performance text-to-speech engine optimized for inference speed.
@@ -254,13 +268,20 @@ class TTS:
             for chunk in text_chunks
         ]
 
-    async def _process_multiple_requests(self, requests: List[TTSRequest], results: Optional[List] = None) -> Optional[
-        TTSOutput]:
+    async def _process_multiple_requests(
+        self,
+        requests: List[TTSRequest],
+        results: Optional[List] = None,
+        on_chunk: Optional[Callable[[TTSOutput], None]] = None,
+    ) -> Optional[TTSOutput]:
         """Process multiple TTS requests in parallel.
 
         Args:
             requests (List[TTSRequest]): List of requests to process.
             results (Optional[List]): Optional list to store results for streaming.
+            on_chunk (Optional[Callable]): Optional callback invoked after each
+                chunk is produced. Used to drive progress display. Does not
+                affect generation semantics.
 
         Returns:
             Optional[TTSOutput]: Combined audio output if not streaming, None otherwise.
@@ -278,6 +299,8 @@ class TTS:
                 chunks.append(chunk)
                 if queue is not None:
                     await queue.put(chunk)
+                if on_chunk is not None:
+                    on_chunk(chunk)
 
             if queue is not None:
                 await queue.put(None)
@@ -307,6 +330,87 @@ class TTS:
             complete_audio = [chunk for chunks in all_chunks for chunk in chunks]
             return TTSOutput.combine_outputs(complete_audio)
 
+    @staticmethod
+    @contextmanager
+    def _progress_context(total_subrequests: int, description: str):
+        """Yield a rich Progress advance-callback; print summary on exit.
+
+        The callback signature is ``advance(chunk: TTSOutput) -> None``. Each
+        call advances the bar by one and updates the live ``tok/s`` field from
+        the global metrics tracker.
+
+        After the ``with`` block exits (normally or via exception), a one-line
+        summary is printed to the shared console with wall-clock time, total
+        audio duration, and realtime-factor (RTF).
+
+        This helper does not affect generation semantics — it only wires
+        display callbacks. Passing ``total_subrequests`` from ``len(requests)``
+        is an approximation of chunk count (XTTSv2 typically yields 1 audio
+        chunk per sub-request at EOS); rich tolerates overshoot gracefully.
+
+        Args:
+            total_subrequests (int): Expected chunk count (upper-bar total).
+            description (str): Short label shown next to the spinner.
+
+        Yields:
+            Callable[[TTSOutput], None]: The ``advance`` callback.
+        """
+        start_time = time.time()
+        chunks_seen: List[TTSOutput] = []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]🔊 {task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("чанков | [yellow]{task.fields[rate]} tok/s"),
+            TextColumn("| осталось"),
+            TimeRemainingColumn(),
+            transient=True,
+            console=_console,
+        ) as progress:
+            task = progress.add_task(description, total=total_subrequests, rate="—")
+
+            def advance(chunk: TTSOutput) -> None:
+                chunks_seen.append(chunk)
+                tps = metrics.tokens_per_second
+                rate = f"{tps:>4.0f}" if tps > 0 else "  —"
+                progress.update(task, advance=1, rate=rate)
+
+            try:
+                yield advance
+            finally:
+                # Stop the progress display before printing the summary so the
+                # transient bar doesn't overwrite the summary line.
+                pass
+
+        # Compute and print summary after the Progress context has torn down.
+        if chunks_seen:
+            elapsed = time.time() - start_time
+            sr = chunks_seen[0].sample_rate or 0
+            total_samples = sum(c.array.shape[0] for c in chunks_seen)
+            audio_sec = total_samples / sr if sr else 0.0
+            rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
+            _console.print(
+                f"[bold green]✅ Готово за {elapsed:.0f} сек[/] | "
+                f"[cyan]{audio_sec / 60:.1f} мин аудио[/] | "
+                f"[magenta]RTF {rtf:.2f}x[/]"
+            )
+
+    @staticmethod
+    def _make_progress_description(request: TTSRequest) -> str:
+        """Build a short human-readable description from the request text.
+
+        Takes up to 40 chars of the text (whitespace-normalised) and appends
+        an ellipsis if truncated. Falls back to the request id when text is
+        a list or generator rather than a plain string.
+        """
+        text = request.text
+        if not isinstance(text, str):
+            return f"req {request.request_id[:8]}"
+        flat = " ".join(text.split())
+        return flat[:40] + ("…" if len(flat) > 40 else "")
+
     def generate_speech(self, request: TTSRequest) -> Union[Generator[TTSOutput, None, None], TTSOutput]:
         """Generate speech synchronously from text.
 
@@ -321,38 +425,45 @@ class TTS:
         """
         self._ensure_event_loop()
         requests = self.split_requests(request)
+        description = self._make_progress_description(request)
 
         if request.stream:
             # Streaming case
             def streaming_wrapper():
-                for sub_request in requests:
-                    # For streaming, execute the async gen
-                    async def process_stream():
-                        try:
-                            async for chunk in self.scheduler.run(
-                                    inputs=sub_request,
-                                    request_id=sub_request.request_id,
-                                    first_phase_fn=self._prepare_generation_context,
-                                    second_phase_fn=self._second_phase_fn
-                            ):
-                                yield chunk
-                        except Exception as e:
-                            self.logger.error(f"Error during streaming: {e}")
-                            raise
+                with self._progress_context(len(requests), description) as advance:
+                    for sub_request in requests:
+                        # For streaming, execute the async gen
+                        async def process_stream():
+                            try:
+                                async for chunk in self.scheduler.run(
+                                        inputs=sub_request,
+                                        request_id=sub_request.request_id,
+                                        first_phase_fn=self._prepare_generation_context,
+                                        second_phase_fn=self._second_phase_fn
+                                ):
+                                    yield chunk
+                            except Exception as e:
+                                self.logger.error(f"Error during streaming: {e}")
+                                raise
 
-                    # Execute the async gen
-                    generator = process_stream()
-                    try:
-                        while True:
-                            chunk = self.loop.run_until_complete(anext(generator))
-                            yield chunk
-                    except StopAsyncIteration:
-                        pass
+                        # Execute the async gen
+                        generator = process_stream()
+                        try:
+                            while True:
+                                chunk = self.loop.run_until_complete(anext(generator))
+                                advance(chunk)
+                                yield chunk
+                        except StopAsyncIteration:
+                            pass
 
             return streaming_wrapper()
         else:
             # Non streaming
-            return self.loop.run_until_complete(self._process_multiple_requests(requests))
+            with self._progress_context(len(requests), description) as advance:
+                result = self.loop.run_until_complete(
+                    self._process_multiple_requests(requests, on_chunk=advance)
+                )
+            return result
 
     async def shutdown(self):
         """Shuts down the TTS engine and scheduler."""
