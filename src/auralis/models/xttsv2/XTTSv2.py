@@ -667,6 +667,11 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
             request_id: Unique request ID
         """
         request_id = f"{request_id}_logits"
+        generator = None
+        output = None
+        sampling_params = None
+        bound_collector = None
+        hidden_states = None
 
 
         # Reset token_ids on each attempt
@@ -678,94 +683,66 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
 
         engine_inputs["multi_modal_data"] = conditioning
 
-        # Reuse the engine-wide collector. bind_to_request installs fresh
-        # per-request state within the shared instance so concurrent calls
-        # remain isolated.
-        bound_collector = self.hidden_states_collector.bind_to_request(request_id)
+        try:
+            # Reuse the engine-wide collector. bind_to_request installs fresh
+            # per-request state within the shared instance so concurrent calls
+            # remain isolated.
+            bound_collector = self.hidden_states_collector.bind_to_request(request_id)
 
-        # Set up sampling parameters with the bound collector
-        sampling_params = ExtendedSamplingParams(
-            detokenize=False,
-            request_id=request_id,
-            max_tokens=1,
-            hidden_state_collector=bound_collector,
-            output_kind=RequestOutputKind.FINAL_ONLY
-        )
-
-        # Generate with unique request ID
-        generator = self.llm_engine.generate(
-            prompt=engine_inputs,
-            sampling_params=sampling_params,
-            request_id=request_id
-        )
-
-        async for output in generator:  # consume the generator
-            if output.finished:
-                pass
-
-        # Get the collected hidden states
-        hidden_states = await self.hidden_states_collector.get_hidden_states(request_id)
-
-        if hidden_states is None:
-            raise RuntimeError(
-                f"No hidden states collected for request {request_id}. "
-                f"This should never happen! Please report this issue on GitHub."
+            # Set up sampling parameters with the bound collector
+            sampling_params = ExtendedSamplingParams(
+                detokenize=False,
+                request_id=request_id,
+                max_tokens=1,
+                hidden_state_collector=bound_collector,
+                output_kind=RequestOutputKind.FINAL_ONLY
             )
-        start_of_audio_hs = conditioning["audio"]["embeds"].shape[0] # type: ignore
-        # Successfully got hidden states
-        return self.final_norm(hidden_states[start_of_audio_hs:-5, ...].unsqueeze(0).to(self.device).to(self.dtype))
 
+            # Generate with unique request ID
+            generator = self.llm_engine.generate(
+                prompt=engine_inputs,
+                sampling_params=sampling_params,
+                request_id=request_id
+            )
 
-    async def _make_sentence_generator(
-        self,
-        sequence: List[int],
-        request: TTSRequest,
-        gpt_embed_inputs: Optional[List[torch.Tensor]],
-        seq_index: int,
-        request_id: str,
-    ) -> AsyncGenerator[RequestOutput, None]:
-        """Deferred per-sentence vLLM generator.
+            async for output in generator:  # consume the generator
+                if output.finished:
+                    pass
 
-        An ``async def`` with ``yield`` produces an *unstarted* async generator
-        — the body does not run until the first ``__anext__`` call. This lets
-        us avoid allocating the per-sentence heavy objects (``ExtendedSampling
-        Params`` with its ``LogitsRepetitionPenalizer``, the ``TokensPrompt``
-        dict, and the vLLM request registration inside ``llm_engine.generate``)
-        until the :class:`TwoPhaseScheduler` actually starts pumping this
-        particular sentence — i.e. after it has acquired ``second_phase_sem``.
-        At any moment only ~``second_phase_concurrency`` (typically ~10)
-        sentences hold these objects, rather than all ``len(tokens_list)``
-        (~900 on long inputs), which was the root cause of the ~1 GB RSS
-        growth observed on 154-minute jobs.
-        """
-        sampling_params = ExtendedSamplingParams(
-            temperature=request.temperature,
-            top_p=request.top_p,
-            detokenize=False,
-            request_id=request_id,
-            top_k=request.top_k,
-            logits_processors=[LogitsRepetitionPenalizer(request.repetition_penalty)],
-            repetition_penalty=1.0,  # handled manually by the logits processor above
-            max_tokens=self.gpt_config.gpt_max_audio_tokens,
-            ignore_eos=True,  # tokenizer eos is for text, not audio tokens
-            stop_token_ids=[self.mel_eos_token_id],
-            output_kind=RequestOutputKind.FINAL_ONLY,
-        )
-        engine_inputs = TokensPrompt(prompt_token_ids=sequence)
-        if gpt_embed_inputs is not None:
-            engine_inputs["multi_modal_data"] = {
-                "audio": {
-                    "embeds": gpt_embed_inputs[seq_index],
-                    "is_logits_only_mode": False,
-                    "sequence_length": len(sequence),
-                }
-            }
-        async for output in self.llm_engine.generate(
-            prompt=engine_inputs,
-            sampling_params=sampling_params,
-            request_id=request_id,
-        ):
-            yield output
+            # Get the collected hidden states
+            hidden_states = await self.hidden_states_collector.get_hidden_states(request_id)
+
+            if hidden_states is None:
+                raise RuntimeError(
+                    f"No hidden states collected for request {request_id}. "
+                    f"This should never happen! Please report this issue on GitHub."
+                )
+            start_of_audio_hs = conditioning["audio"]["embeds"].shape[0] # type: ignore
+            # Successfully got hidden states
+            result = self.final_norm(
+                hidden_states[start_of_audio_hs:-5, ...]
+                .unsqueeze(0)
+                .to(self.device)
+                .to(self.dtype)
+            )
+            return result
+        finally:
+            # The logits-only pass is a separate vLLM request. Abort it just
+            # like the main audio-token request so vLLM can release its
+            # SequenceGroup, SamplingParams, multimodal data and callback refs.
+            try:
+                await self.llm_engine.abort(request_id)
+            except Exception as e:
+                self.logger.debug(f"llm_engine.abort({request_id}) failed: {e}")
+            if sampling_params is not None:
+                try:
+                    sampling_params.hidden_state_collector = None
+                except Exception as e:
+                    self.logger.debug(f"Could not clear hidden_state_collector for {request_id}: {e}")
+            del bound_collector, sampling_params, generator, output, engine_inputs, conditioning, hidden_states
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
 
     @torch.inference_mode()
     async def get_generation_context(self,
@@ -800,25 +777,41 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                                                                                 split_text=True)
             gpt_embed_inputs = await self._merge_conditioning(text_embeddings, gpt_cond_latent)
 
-        # Build an *unstarted* async generator per sentence. The vLLM
-        # request, ExtendedSamplingParams and TokensPrompt are materialised
-        # lazily inside _make_sentence_generator (see its docstring), so at
-        # any moment only ~second_phase_concurrency of them exist — not all
-        # len(tokens_list). The requests_id list is still populated eagerly
-        # because callers (and the collector) need stable ids up front.
+        # Start all requests in parallel
         generators = []
         requests_id = []
         for seq_index, sequence in enumerate(tokens_list):
-            request_id = f"{request.request_id}_{seq_index}"
-            generators.append(
-                self._make_sentence_generator(
-                    sequence=sequence,
-                    request=request,
-                    gpt_embed_inputs=gpt_embed_inputs,
-                    seq_index=seq_index,
-                    request_id=request_id,
-                )
+            sampling_params = ExtendedSamplingParams(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                detokenize=False,
+                request_id=uuid.uuid4(),
+                top_k=request.top_k,
+                logits_processors=[LogitsRepetitionPenalizer(request.repetition_penalty)],
+                repetition_penalty=1.0,  # Since we're handling repetition penalty manually
+                max_tokens=self.gpt_config.gpt_max_audio_tokens,
+                ignore_eos=True,  # Ignore the tokenizer eos token since it is for textual generation
+                stop_token_ids=[self.mel_eos_token_id],
+                output_kind=RequestOutputKind.FINAL_ONLY
             )
+
+            engine_inputs = TokensPrompt(prompt_token_ids=sequence)
+            if gpt_embed_inputs is not None:
+                engine_inputs["multi_modal_data"] = {
+                    "audio": {
+                        "embeds": gpt_embed_inputs[seq_index],
+                        "is_logits_only_mode": False,
+                        "sequence_length": len(sequence)
+                    }
+                }
+            request_id =f"{request.request_id}_{seq_index}"
+            # Get audio token generator from VLLM
+            token_generator = self.llm_engine.generate(
+                prompt=engine_inputs,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+            generators.append(token_generator)
             requests_id.append(request_id)
 
         return generators, requests_id, speaker_embeddings, gpt_embed_inputs
@@ -849,42 +842,54 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         async for output in generator:
 
             if output.finished:
+                output_request_id = output.request_id
+                token_ids = list(output.outputs[0].token_ids)
+                token_length = len(token_ids)
+                hidden_states = None
+                tts_output = None
                 # get the hidden states
-                hidden_states = await self.get_model_logits(
-                    list(output.outputs[0].token_ids),
-                    {
-                        "audio": {
-                            'embeds': multimodal_data,  # Use multimodal data for conditioning
-                            "is_logits_only_mode": True,
-                            "sequence_length": False # to be inserted later
+                try:
+                    hidden_states = await self.get_model_logits(
+                        token_ids,
+                        {
+                            "audio": {
+                                'embeds': multimodal_data,  # Use multimodal data for conditioning
+                                "is_logits_only_mode": True,
+                                "sequence_length": False # to be inserted later
+                            },
                         },
-                    },
-                    output.request_id
-                )
+                        output_request_id
+                    )
 
+                    async with self.decoder_semaphore:
+                        async with self.cuda_memory_manager():
+                            wav = (await asyncio.to_thread(self.hifigan_decoder,
+                                    hidden_states,
+                                    g=speaker_embeddings
+                                )).cpu().detach().numpy().squeeze()
+                             # noqa
 
-                async with self.decoder_semaphore:
-                    async with self.cuda_memory_manager():
-                        wav = (await asyncio.to_thread(self.hifigan_decoder,
-                                hidden_states,
-                                g=speaker_embeddings
-                            )).cpu().detach().numpy().squeeze()
-                         # noqa
+                            tts_output = TTSOutput(array= wav,
+                                                   start_time = request.start_time,
+                                                   token_length = token_length
+                                                   )
+                            del wav
+                finally:
+                    del hidden_states
+                    # Free vLLM-internal metadata for the finished request
+                    # before yielding the CPU audio chunk to the caller.
+                    try:
+                        await self.llm_engine.abort(output_request_id)
+                    except Exception as e:  # best-effort — do not break streaming
+                        self.logger.debug(
+                            f"llm_engine.abort({output_request_id}) failed: {e}"
+                        )
+                    del output, token_ids
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                        # yield the audio output
-                        yield TTSOutput(array= wav,
-                                        start_time = request.start_time,
-                                        token_length = len(output.outputs[0].token_ids)
-                                        )
-
-                # Note: llm_engine.abort(output.request_id) used to live here
-                # as a workaround for eager submission of all N sentences up
-                # front. With the lazy _make_sentence_generator path the
-                # request is scoped to this async-for frame and released by GC
-                # as soon as the generator exits — abort() is redundant and
-                # measurably slowed RTF (0.071 -> 0.083). Kept as a comment
-                # so future readers do not re-add it.
-
+                if tts_output is not None:
+                    yield tts_output
 
 
     async def shutdown(self):
@@ -895,4 +900,3 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         except Exception as e:  # defensive — do not block engine shutdown
             self.logger.warning(f"HiddenStatesCollector shutdown failed: {e}")
         self.llm_engine.shutdown_background_loop()
-

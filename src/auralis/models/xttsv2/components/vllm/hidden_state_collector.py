@@ -110,7 +110,7 @@ class HiddenStatesCollector:
         try:
             with self.locks[request_id]:
                 if hidden_states is not None:
-                    self.outputs[request_id].append(hidden_states.clone())
+                    self.outputs[request_id].append(hidden_states.detach().clone())
                     self.states_count[request_id] += 1
                     self.logger.debug(f"Collected state {self.states_count[request_id]} for request {request_id}")
 
