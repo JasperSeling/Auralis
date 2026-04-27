@@ -53,7 +53,6 @@ setup(
         "pypinyin",
         "rich",
         "safetensors",
-        "sounddevice",
         "soundfile",
         "spacy>=3.8.0",
         "setuptools",
@@ -72,6 +71,9 @@ setup(
 
     ],
     extras_require={
+        'audio': [
+            'sounddevice',
+        ],
         'docs': [
             'mkdocs>=1.4.0',
             'mkdocs-material>=9.0.0',

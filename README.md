@@ -61,6 +61,10 @@ You can see [here](https://github.com/astramind-ai/Auralis/tree/main/docs/USING_
 # 1. Системные либы (только Linux/Colab/Kaggle)
 apt-get install -y libportaudio2 libportaudiocpp0 portaudio19-dev
 
+# sounddevice требует системную библиотеку portaudio:
+# apt-get install -y libportaudio2 libportaudiocpp0 portaudio19-dev
+# pip install sounddevice   ← только после apt
+
 # 2. PyTorch с CUDA 12.1
 pip install torch==2.5.1 torchaudio==2.5.1 \
   --index-url https://download.pytorch.org/whl/cu121
