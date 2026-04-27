@@ -668,52 +668,91 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         """
         request_id = f"{request_id}_logits"
 
+        # Pre-declare every local that the finally block touches. If anything
+        # raises before the corresponding assignment, finally still runs cleanly.
+        generator = None
+        output = None
+        sampling_params = None
+        bound_collector = None
+        hidden_states = None
+        result = None
 
-        # Reset token_ids on each attempt
-        token_ids = ([self.mel_bos_token_id] + list(token_ids) + [self.mel_eos_token_id] * 4)
-        # we need 5 eos tokens
+        try:
+            # Reset token_ids on each attempt
+            token_ids = ([self.mel_bos_token_id] + list(token_ids) + [self.mel_eos_token_id] * 4)
+            # we need 5 eos tokens
 
-        engine_inputs = TokensPrompt(prompt_token_ids=token_ids)
-        conditioning['audio']['sequence_length'] = len(token_ids)
+            engine_inputs = TokensPrompt(prompt_token_ids=token_ids)
+            conditioning['audio']['sequence_length'] = len(token_ids)
 
-        engine_inputs["multi_modal_data"] = conditioning
+            engine_inputs["multi_modal_data"] = conditioning
 
-        # Reuse the engine-wide collector. bind_to_request installs fresh
-        # per-request state within the shared instance so concurrent calls
-        # remain isolated.
-        bound_collector = self.hidden_states_collector.bind_to_request(request_id)
+            # Reuse the engine-wide collector. bind_to_request installs fresh
+            # per-request state within the shared instance so concurrent calls
+            # remain isolated.
+            bound_collector = self.hidden_states_collector.bind_to_request(request_id)
 
-        # Set up sampling parameters with the bound collector
-        sampling_params = ExtendedSamplingParams(
-            detokenize=False,
-            request_id=request_id,
-            max_tokens=1,
-            hidden_state_collector=bound_collector,
-            output_kind=RequestOutputKind.FINAL_ONLY
-        )
-
-        # Generate with unique request ID
-        generator = self.llm_engine.generate(
-            prompt=engine_inputs,
-            sampling_params=sampling_params,
-            request_id=request_id
-        )
-
-        async for output in generator:  # consume the generator
-            if output.finished:
-                pass
-
-        # Get the collected hidden states
-        hidden_states = await self.hidden_states_collector.get_hidden_states(request_id)
-
-        if hidden_states is None:
-            raise RuntimeError(
-                f"No hidden states collected for request {request_id}. "
-                f"This should never happen! Please report this issue on GitHub."
+            # Set up sampling parameters with the bound collector
+            sampling_params = ExtendedSamplingParams(
+                detokenize=False,
+                request_id=request_id,
+                max_tokens=1,
+                hidden_state_collector=bound_collector,
+                output_kind=RequestOutputKind.FINAL_ONLY
             )
-        start_of_audio_hs = conditioning["audio"]["embeds"].shape[0] # type: ignore
-        # Successfully got hidden states
-        return self.final_norm(hidden_states[start_of_audio_hs:-5, ...].unsqueeze(0).to(self.device).to(self.dtype))
+
+            # Generate with unique request ID
+            generator = self.llm_engine.generate(
+                prompt=engine_inputs,
+                sampling_params=sampling_params,
+                request_id=request_id
+            )
+
+            async for output in generator:  # consume the generator
+                if output.finished:
+                    pass
+
+            # Get the collected hidden states
+            hidden_states = await self.hidden_states_collector.get_hidden_states(request_id)
+
+            if hidden_states is None:
+                raise RuntimeError(
+                    f"No hidden states collected for request {request_id}. "
+                    f"This should never happen! Please report this issue on GitHub."
+                )
+            start_of_audio_hs = conditioning["audio"]["embeds"].shape[0] # type: ignore
+            # Successfully got hidden states
+            result = self.final_norm(
+                hidden_states[start_of_audio_hs:-5, ...]
+                .unsqueeze(0)
+                .to(self.device)
+                .to(self.dtype)
+            )
+            del hidden_states
+            hidden_states = None
+            return result
+        finally:
+            # Tell vLLM the logits-only request is done so it can release the
+            # SequenceGroup, KV-cache slabs and multi-modal data refs.
+            try:
+                await self.llm_engine.abort(request_id)
+            except Exception as e:
+                self.logger.debug(
+                    f"llm_engine.abort({request_id}) failed: {e}"
+                )
+            # Break the sampling_params -> SyncCollectorWrapper -> collector
+            # cycle that vLLM keeps alive via finished RequestOutput history.
+            if sampling_params is not None:
+                try:
+                    sampling_params.hidden_state_collector = None
+                except Exception as e:
+                    self.logger.debug(
+                        f"Could not clear hidden_state_collector for {request_id}: {e}"
+                    )
+            # Drop refs to anything that pins GPU tensors / vLLM internals.
+            del bound_collector, sampling_params, generator, output, hidden_states
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
     async def _make_sentence_generator(
@@ -849,41 +888,97 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         async for output in generator:
 
             if output.finished:
-                # get the hidden states
-                hidden_states = await self.get_model_logits(
-                    list(output.outputs[0].token_ids),
-                    {
-                        "audio": {
-                            'embeds': multimodal_data,  # Use multimodal data for conditioning
-                            "is_logits_only_mode": True,
-                            "sequence_length": False # to be inserted later
+                # Capture identifiers up front so the finally block does not
+                # depend on `output` still being alive.
+                output_request_id = output.request_id
+                token_length = len(output.outputs[0].token_ids)
+                hidden_states = None
+                tts_output = None
+                try:
+                    # get the hidden states (separate logits-only vLLM request,
+                    # cleaned up internally by get_model_logits' own finally).
+                    hidden_states = await self.get_model_logits(
+                        list(output.outputs[0].token_ids),
+                        {
+                            "audio": {
+                                'embeds': multimodal_data,  # Use multimodal data for conditioning
+                                "is_logits_only_mode": True,
+                                "sequence_length": False # to be inserted later
+                            },
                         },
-                    },
-                    output.request_id
-                )
+                        output_request_id
+                    )
 
-
-                async with self.decoder_semaphore:
-                    async with self.cuda_memory_manager():
-                        wav = (await asyncio.to_thread(self.hifigan_decoder,
+                    async with self.decoder_semaphore:
+                        async with self.cuda_memory_manager():
+                            wav = (await asyncio.to_thread(
+                                self.hifigan_decoder,
                                 hidden_states,
                                 g=speaker_embeddings
                             )).cpu().detach().numpy().squeeze()
-                         # noqa
+                            tts_output = TTSOutput(
+                                array=wav,
+                                start_time=request.start_time,
+                                token_length=token_length,
+                            )
+                            del wav
+                        # hidden_states is no longer needed after HiFi-GAN
+                        # decode; drop the GPU ref while still inside the
+                        # decoder_semaphore so cuda_memory_manager.empty_cache
+                        # has actually freed memory by the time we yield.
+                        del hidden_states
+                        hidden_states = None
+                finally:
+                    # Free vLLM-internal metadata (SequenceGroup, KV-cache
+                    # slabs, multi-modal data ref, sampling params) for the
+                    # finished audio-token request *before* yielding the CPU
+                    # audio chunk to the caller. Without this abort the KV
+                    # cache from the last sub-request stays resident until the
+                    # next add_request evicts it (~50 tensors / ~1.87 GiB on
+                    # the symptom we are fixing).
+                    try:
+                        await self.llm_engine.abort(output_request_id)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"llm_engine.abort({output_request_id}) failed: {e}"
+                        )
+                    # If hidden_states was assigned but the body raised before
+                    # we got to del it, drop it now.
+                    if hidden_states is not None:
+                        del hidden_states
+                    # Drop CPU-side per-request entries from the positional
+                    # embeddings tracker. compute_logits() in vllm_mm_gpt.py
+                    # only clears these for the logits-only request (the only
+                    # path with hidden_state_collector != None); audio-token
+                    # requests would otherwise accumulate ~prefill_len + N
+                    # string keys per sentence in token_to_request, growing
+                    # monotonically across save_stream() calls. Reaching the
+                    # tracker through the vLLM private path is fragile, hence
+                    # best-effort with debug-only logging on failure.
+                    try:
+                        pe = (
+                            self.llm_engine.engine
+                            .model_executor.driver_worker
+                            .model_runner.model
+                            .positional_embeddings_correcter
+                        )
+                        pe.clear_request(output_request_id)
+                        pe.clear_request(f"{output_request_id}_logits")
+                    except Exception as e:
+                        self.logger.debug(
+                            f"clear_request({output_request_id}) failed: {e}"
+                        )
+                    del output, output_request_id
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                        # yield the audio output
-                        yield TTSOutput(array= wav,
-                                        start_time = request.start_time,
-                                        token_length = len(output.outputs[0].token_ids)
-                                        )
-
-                # Note: llm_engine.abort(output.request_id) used to live here
-                # as a workaround for eager submission of all N sentences up
-                # front. With the lazy _make_sentence_generator path the
-                # request is scoped to this async-for frame and released by GC
-                # as soon as the generator exits — abort() is redundant and
-                # measurably slowed RTF (0.071 -> 0.083). Kept as a comment
-                # so future readers do not re-add it.
+                if tts_output is not None:
+                    # yield AFTER both context managers have exited and the
+                    # finally block has aborted the request + emptied the
+                    # cache. Yielding inside cuda_memory_manager would defer
+                    # empty_cache for the duration the consumer holds the
+                    # generator, defeating the point of the manager.
+                    yield tts_output
 
 
 
