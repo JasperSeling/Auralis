@@ -59,7 +59,9 @@ setup(
         "setuptools",
         "safetensors",
         "tokenizers",
-        "transformers==4.44.2",
+        # transformers 4.45+ breaks XTTSTokenizerFast compatibility with vLLM 0.6.4
+        # all_special_tokens_extended property missing in custom tokenizer
+        "transformers>=4.44.2,<4.45.0",
         "vllm==0.6.4.post1",
         "nvidia-ml-py",
         "numpy<2.0",
