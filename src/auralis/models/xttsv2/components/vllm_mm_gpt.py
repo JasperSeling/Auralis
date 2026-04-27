@@ -283,7 +283,10 @@ def input_mapper_for_xtts(ctx: InputContext, data: Union[Dict, List[Tensor]]) ->
     assert is_list_of(data, dict, check="all"), (f"Expected a list of dictionaries, "
                                                  f"but got a list of {[type(dat) for dat in data if type(dat) != dict][0]}")
 
-    embeds = [dat["embeds"] for dat in data]
+    embeds = [
+        dat["embeds"].detach() if torch.is_tensor(dat["embeds"]) else dat["embeds"]
+        for dat in data
+    ]
     is_logits_only_mode = [dat.get("is_logits_only_mode", False) for dat in data]
     sequence_length = [dat.get("sequence_length", -1) for dat in data]
     return MultiModalKwargs(
@@ -777,7 +780,7 @@ class GPT2Model(nn.Module):
         for idx, (inserion_idx, conditioning_input) in enumerate(zip(insertion_ids, conditioning_inputs)):
                 hidden_states = torch.cat([
                 hidden_states[:inserion_idx],
-                conditioning_input.squeeze(0),
+                conditioning_input.squeeze(0).detach(),
                 (start_of_generation_embed if ~is_logit_only[idx] else empty_tensor),
                 hidden_states[inserion_idx:]], dim=0
             )
@@ -847,4 +850,3 @@ class GPT2Model(nn.Module):
 
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
-

@@ -349,11 +349,13 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         """
         audio_16k = torchaudio.functional.resample(audio, sr, 16000)
         async with self.decoder_semaphore:
-            return (
-                self.hifigan_decoder.speaker_encoder.forward(audio_16k.to(self.device), l2_norm=True)
-                .unsqueeze(-1)
-                .to(self.device)
-            )
+            with torch.no_grad():
+                emb = (
+                    self.hifigan_decoder.speaker_encoder.forward(audio_16k.to(self.device), l2_norm=True)
+                    .unsqueeze(-1)
+                    .to(self.device)
+                )
+            return emb
 
     async def _merge_conditioning(self,
                                   text_conditioning: List[torch.Tensor],
@@ -370,7 +372,7 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         cond_latents = []
         for text_embedding in text_conditioning:
             # Concatenate along sequence dimension
-            cond_latents.append((torch.cat([audio_conditioning, text_embedding], dim=1).squeeze(0)
+            cond_latents.append((torch.cat([audio_conditioning.detach(), text_embedding], dim=1).squeeze(0)
                                  .to(self.llm_engine.engine.model_config.dtype)))
         return cond_latents
 
@@ -386,25 +388,45 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         Returns:
             torch.Tensor: GPT conditioning latents.
         """
-        if sr != 22050:
-            audio = torchaudio.functional.resample(audio, sr, 22050)
-        if length > 0:
-            audio = audio[:, : 22050 * length]
-        if self.gpt_config.use_perceiver_resampler:
-            style_embs = []
-            for i in range(0, audio.shape[1], 22050 * chunk_length):
-                audio_chunk = audio[:, i: i + 22050 * chunk_length]
+        with torch.no_grad():
+            if sr != 22050:
+                audio = torchaudio.functional.resample(audio, sr, 22050)
+            if length > 0:
+                audio = audio[:, : 22050 * length]
+            if self.gpt_config.use_perceiver_resampler:
+                style_embs = []
+                for i in range(0, audio.shape[1], 22050 * chunk_length):
+                    audio_chunk = audio[:, i: i + 22050 * chunk_length]
 
-                # if the chunk is too short ignore it
-                if audio_chunk.size(-1) < 22050 * 0.33:
-                    continue
+                    # if the chunk is too short ignore it
+                    if audio_chunk.size(-1) < 22050 * 0.33:
+                        continue
 
-                mel_chunk = wav_to_mel_cloning(
-                    audio_chunk,
+                    mel_chunk = wav_to_mel_cloning(
+                        audio_chunk,
+                        mel_norms=self.mel_stats.cpu(),
+                        n_fft=2048,
+                        hop_length=256,
+                        win_length=1024,
+                        power=2,
+                        normalized=False,
+                        sample_rate=22050,
+                        f_min=0,
+                        f_max=8000,
+                        n_mels=80,
+                    )
+                    style_emb = self.get_style_emb(mel_chunk.to(self.device), None)
+                    style_embs.append(style_emb)
+
+                # mean style embedding
+                cond_latent = torch.stack(style_embs).mean(dim=0)
+            else:
+                mel = wav_to_mel_cloning(
+                    audio,
                     mel_norms=self.mel_stats.cpu(),
-                    n_fft=2048,
-                    hop_length=256,
-                    win_length=1024,
+                    n_fft=4096,
+                    hop_length=1024,
+                    win_length=4096,
                     power=2,
                     normalized=False,
                     sample_rate=22050,
@@ -412,27 +434,8 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
                     f_max=8000,
                     n_mels=80,
                 )
-                style_emb = self.get_style_emb(mel_chunk.to(self.device), None)
-                style_embs.append(style_emb)
-
-            # mean style embedding
-            cond_latent = torch.stack(style_embs).mean(dim=0)
-        else:
-            mel = wav_to_mel_cloning(
-                audio,
-                mel_norms=self.mel_stats.cpu(),
-                n_fft=4096,
-                hop_length=1024,
-                win_length=4096,
-                power=2,
-                normalized=False,
-                sample_rate=22050,
-                f_min=0,
-                f_max=8000,
-                n_mels=80,
-            )
-            cond_latent = self.get_style_emb(mel.to(self.device))
-        return cond_latent.transpose(1, 2)
+                cond_latent = self.get_style_emb(mel.to(self.device))
+            return cond_latent.transpose(1, 2)
 
     async def get_conditioning_latents(
             self,
@@ -493,7 +496,12 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         speaker_embedding = torch.stack(speaker_embeddings)
         speaker_embedding = speaker_embedding.mean(dim=0)
 
-        return gpt_cond_latents, speaker_embedding
+        if isinstance(gpt_cond_latents, list):
+            gpt_cond_latents = [t.detach() for t in gpt_cond_latents]
+        else:
+            gpt_cond_latents = gpt_cond_latents.detach()
+
+        return gpt_cond_latents, speaker_embedding.detach()
 
     @asynccontextmanager
     async def cuda_memory_manager(self):
@@ -518,18 +526,19 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         Returns:
             torch.Tensor: Style embedding tensor.
         """
-        if not return_latent:
-            if cond_input.ndim == 4:
-                cond_input = cond_input.squeeze(1)
-            conds = self.conditioning_encoder(cond_input)
+        with torch.no_grad():
+            if not return_latent:
+                if cond_input.ndim == 4:
+                    cond_input = cond_input.squeeze(1)
+                conds = self.conditioning_encoder(cond_input)
 
-            if hasattr(self, 'conditioning_perceiver'):
-                conds = self.conditioning_perceiver(
-                    conds.permute(0, 2, 1)
-                ).transpose(1, 2) # (b,d,32)
-        else:
-            conds = cond_input.unsqueeze(1)
-        return conds
+                if hasattr(self, 'conditioning_perceiver'):
+                    conds = self.conditioning_perceiver(
+                        conds.permute(0, 2, 1)
+                    ).transpose(1, 2) # (b,d,32)
+            else:
+                conds = cond_input.unsqueeze(1)
+        return conds.detach()
 
     async def prepare_text_tokens_async(self, text: str, language: str, split_text=False) \
             -> Tuple[List[Union[int, List[int]]], List[torch.Tensor]]:
@@ -990,4 +999,3 @@ class XTTSv2Engine(BaseAsyncTTSEngine):
         except Exception as e:  # defensive — do not block engine shutdown
             self.logger.warning(f"HiddenStatesCollector shutdown failed: {e}")
         self.llm_engine.shutdown_background_loop()
-
