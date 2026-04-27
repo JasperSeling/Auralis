@@ -40,7 +40,7 @@ setup(
         "einops",
         "ffmpeg",
         "fsspec",
-        "hangul_romanize",
+        "hangul-romanize",
         "huggingface_hub",
         "ipython",
         "librosa",
@@ -58,12 +58,11 @@ setup(
         "spacy>=3.8.0",
         "setuptools",
         "safetensors",
-        "torchaudio",
         "tokenizers",
-        "transformers",
+        "transformers==4.44.2",
         "vllm==0.6.4.post1",
         "nvidia-ml-py",
-        "numpy",
+        "numpy<2.0",
         "langid"
 
     ],

@@ -55,6 +55,20 @@ auralis.openai --host 127.0.0.1 --port 8000 --model AstraMindAI/xttsv2 --gpt_mod
 ```
 You can see [here](https://github.com/astramind-ai/Auralis/tree/main/docs/USING_OAI_SERVER.md) for a more in-depth explanation or try it out with this [example](https://github.com/astramind-ai/Auralis/tree/main/examples/use_openai_server.py)
 
+## Installation (Kaggle / Colab)
+
+```bash
+# 1. Системные либы (только Linux/Colab/Kaggle)
+apt-get install -y libportaudio2 libportaudiocpp0 portaudio19-dev
+
+# 2. PyTorch с CUDA 12.1
+pip install torch==2.5.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+
+# 3. Auralis (все остальные зависимости подтянутся автоматически)
+pip install git+https://github.com/astramind-ai/Auralis.git
+```
+
 ## Key Features 🛸
 
 ### Speed & Efficiency
