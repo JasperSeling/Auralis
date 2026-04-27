@@ -17,6 +17,15 @@ Auralis is an async TTS engine wrapping XTTSv2 on top of vLLM, optimised for hig
 | **Test command** | `python -m pytest tests/unit -v` |
 | **Entry point** | `auralis.openai` — OpenAI-compatible REST server (`src/auralis/entrypoints/oai_server.py`). |
 
+## Audit reports (read before non-trivial changes)
+
+- `docs/VLLM_COMPATIBILITY_AUDIT.md` — V0→V1 migration blockers, why we are pinned to `vllm==0.6.4.post1`.
+- `docs/vllm_engine_lifecycle_audit.md` — where the engine is created, why GPU memory grows between `save_stream()` calls, and the `from_pretrained()` double-engine risk (§9 below).
+- `docs/generation_parameters_audit.md` — sampling-params, multimodal-data and KV-cache retention paths.
+- `hidden_states_leak_audit.md` (repo root, not `docs/`) — the long-form companion to §3–§4 below; deeper traces, raw greps, and the reasoning behind the structured cleanup pattern in §2.
+- `docs/auralis_report.md` — print/logger inventory and pipeline trace.
+- `docs/streaming_audio_analysis.md` — yield levels (engine / scheduler / API) and sample-rate handling.
+
 ---
 
 ## Minimal usage
@@ -39,7 +48,7 @@ stats = tts.save_stream(request, "output.flac")
 
 Two-phase scheduler in `src/auralis/common/scheduling/two_phase_scheduler.py`:
 
-1. **`TTS._prepare_generation_context`** (`src/auralis/core/tts.py`) — invokes `XTTSv2.get_generation_context`, which tokenises the text, builds conditioning, and **eagerly calls `llm_engine.generate()` for every sentence**, collecting async generators into a list.
+1. **`TTS._prepare_generation_context`** (`src/auralis/core/tts.py`) — invokes `XTTSv2.get_generation_context`, which tokenises the text, builds conditioning, and **eagerly calls `llm_engine.generate()` for every sentence**, collecting async generators into a list. (A lazy variant was attempted in `bfdda62` and reverted in `9e924d5`; eager submission paired with the structured cleanup pattern in §2 is the production code path.)
 2. **`TTS._second_phase_fn` → `XTTSv2.process_tokens_to_speech`** — iterates each generator; for every finished sentence it runs a **second** `llm_engine.generate(max_tokens=1)` via `get_model_logits` solely to collect hidden states (legacy V0 hack, see Known bugs #6), then decodes on a thread via `asyncio.to_thread(self.hifigan_decoder, ...)`.
 
 Streaming writers `save_stream` / `save_stream_async` in `src/auralis/core/tts.py` flush audio chunks straight to disk — RAM footprint is O(1) regardless of duration.
@@ -60,11 +69,17 @@ The empirical polynomial (`src/auralis/models/xttsv2/XTTSv2.py`) returns GB of m
 
 A proper fix would require recalibrating the polynomial (or deleting it and using a sensible default like `0.85`). That is not done here.
 
-### 2. `llm_engine.generate()` is eager
+### 2. `llm_engine.generate()` is eager — cleanup must be structured
 
-It submits the request to vLLM's scheduler at call time; it is not a lazy iterator. Building `generators = [llm_engine.generate(...) for ... in tokens_list]` puts **every** sentence into vLLM's waiting queue simultaneously, each pinning its `SequenceGroup`, multi-modal audio embeddings, and our `ExtendedSamplingParams`.
+`AsyncLLMEngine.generate()` registers the request with vLLM's scheduler at call time; it is not a lazy iterator. The current loop in `XTTSv2.get_generation_context` submits every sentence in a sub-request up front, each pinning its `SequenceGroup`, multi-modal audio embeddings, and our `ExtendedSamplingParams`. A lazy `_make_sentence_generator` variant was tried in `bfdda62` and reverted in `9e924d5`; the production answer is **eager submission + disciplined per-request cleanup**.
 
-**Rule**: `process_tokens_to_speech` calls `await self.llm_engine.abort(output.request_id)` immediately after yielding a finished sentence's audio. Any new code path that consumes vLLM generators must do the same or pay the RAM cost (~1 MB per sentence on 900-sentence jobs).
+**Rule** (current shape of `process_tokens_to_speech` and `get_model_logits` after `9e924d5`):
+
+- Wrap the body that owns vLLM-side state in `try` / `finally`.
+- In the `finally`: `await self.llm_engine.abort(request_id)`, set `sampling_params.hidden_state_collector = None` (for the logits-only path), `del` every local that holds GPU tensors / generators / outputs, and call `torch.cuda.empty_cache()`.
+- **Yield the `TTSOutput` *outside* `decoder_semaphore` and `cuda_memory_manager`** — build it inside the CUDA context, but `yield tts_output` only after the contexts exit and the `finally` block has aborted and freed locals. Yielding while still inside `cuda_memory_manager` lets the caller (and downstream `parallel_inputs` references) keep the per-sentence GPU state alive across `await` points.
+
+Any new code path that calls `llm_engine.generate()` must follow the same shape, or it will leak ~1 MB of vLLM metadata per sentence (~900 MB on 154-minute jobs).
 
 ### 3. `HiddenStatesCollector` is shared per engine
 
@@ -81,7 +96,9 @@ Legacy V0 hidden-states collection uses `ExtendedSamplingParams.hidden_state_col
 - no-outputs `ValueError`
 - the outer `except` handler
 
-`tests/unit/test_hidden_states_collector_leak.py` guards all four paths plus a shared-instance reuse test. Keep it passing.
+In the collector itself, hidden states are stored as `hidden_states.detach().clone()` (not just `.clone()`). The `.detach()` is load-bearing: vLLM hands us tensors that are still attached to autograd graph nodes, and a bare `.clone()` keeps the entire computation graph alive across the request lifetime. See the diff in `9e924d5`.
+
+`tests/unit/test_hidden_states_collector_leak.py` guards all four exit paths plus a shared-instance reuse test. Keep it passing.
 
 ### 5. `asyncio.to_thread` grows a default executor
 
@@ -103,12 +120,16 @@ The rich progress setup in `tts.py` uses `MofNCompleteColumn` with **`total=None
 
 Do not introduce `self.loop.run_until_complete(...)` inside it — the coroutine is already scheduled on `self.loop`.
 
+### 9. `TTS.from_pretrained()` can leak the previous vLLM engine
+
+Documented in `docs/vllm_engine_lifecycle_audit.md`. Calling `TTS.from_pretrained()` twice on the same `TTS` instance overwrites `self.tts_engine` without shutting down the previous engine — the old `AsyncLLMEngine` (and its KV-cache reservation) stays alive on the GPU. Only matters if user code reloads models on the same instance, but it is a real footgun and the audit recommends a `if self.tts_engine is not None: self.loop.run_until_complete(self.tts_engine.shutdown())` guard. Patch is suggested in the audit but **not yet applied** — see Outstanding work.
+
 ---
 
 ## Editing playbook
 
-- **Before changing `XTTSv2.process_tokens_to_speech`**: re-read §2 and §3. Any new yield path must abort the finished request.
-- **Before changing `hidden_state_collector.py`**: run `python -m pytest tests/unit/test_hidden_states_collector_leak.py -v`. Every early-return path in `get_hidden_states` must call `_cleanup_request`.
+- **Before changing `XTTSv2.process_tokens_to_speech` or `get_model_logits`**: re-read §2. Cleanup must be in `finally`; `yield` must be outside `decoder_semaphore` / `cuda_memory_manager`; `abort` + `del` + `empty_cache` must run before yielding.
+- **Before changing `hidden_state_collector.py`**: run `python -m pytest tests/unit/test_hidden_states_collector_leak.py -v`. Every early-return path in `get_hidden_states` must call `_cleanup_request`. Stored tensors must be `detach().clone()`, not bare `.clone()`.
 - **Before adding new `asyncio.to_thread` sites**: confirm they run on `self.loop` so `TTS.shutdown` cleans them up.
 - **Before touching the progress bar**: do not put a numeric denominator on it unless you also count audio chunks, not input slices.
 - **Tests that must stay hermetic** (runnable without CUDA/vLLM/torio): load the module under test via `importlib.util.spec_from_file_location` rather than importing through `auralis.*`, following the pattern in `tests/unit/test_hidden_states_collector_leak.py`.
@@ -117,7 +138,8 @@ Do not introduce `self.loop.run_until_complete(...)` inside it — the coroutine
 
 ## Outstanding work (low-confidence backlog)
 
-- **Lazy generator pipeline.** The eager-generate + per-sentence-abort pattern is a workaround. A real fix would iterate sentences one at a time (or in bounded batches of `max_concurrency`) rather than queueing hundreds of requests in vLLM up front. Requires changing the `_prepare_generation_context` → `TwoPhaseScheduler` → `_second_phase_fn` contract.
+- **Engine shutdown in `TTS.from_pretrained`.** The patch in `docs/vllm_engine_lifecycle_audit.md` (§6) is small and concrete: shut down `self.tts_engine` if non-`None` before reloading. Not yet applied.
+- **Lazy generator pipeline (revisit).** Attempted in `bfdda62`, reverted in `9e924d5` in favour of eager submission + structured cleanup. If `gpt_embed_inputs` floor (~135 MiB on 900-sentence jobs) becomes the dominant remaining growth, revisiting laziness — or better, streaming `gpt_embed_inputs` itself — is the next lever.
 - **Polynomial replacement.** Either delete `get_memory_usage_curve` and default `gpu_memory_utilization` to 0.85, or recalibrate with real measurements across GPUs. The current polynomial is actively misleading.
 - **V1 engine migration.** `docs/VLLM_COMPATIBILITY_AUDIT.md` enumerates the blocking issues. Until that lands, we are stuck on `vllm==0.6.4.post1`.
 
