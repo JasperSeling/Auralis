@@ -23,6 +23,7 @@ Auralis is an async TTS engine wrapping XTTSv2 on top of vLLM, optimised for hig
 - `docs/vllm_engine_lifecycle_audit.md` — where the engine is created, why GPU memory grows between `save_stream()` calls, and the `from_pretrained()` double-engine risk (§9 below).
 - `docs/generation_parameters_audit.md` — sampling-params, multimodal-data and KV-cache retention paths.
 - `hidden_states_leak_audit.md` (repo root, not `docs/`) — the long-form companion to §3–§4 below; deeper traces, raw greps, and the reasoning behind the structured cleanup pattern in §2.
+- `kv_cache_leak_audit.md` (repo root) — the static analysis behind the `9b48910` fix: 5 leak points (audio-token + logits-only `abort` missing, `yield` inside `cuda_memory_manager`, `PositionalEmbeddingsCorrecter.clear_request` only firing for logits-only, missing `del` of locals); each with file:line and the symptom math (1.87 GiB / ~51 tensors per `save_stream`).
 - `docs/auralis_report.md` — print/logger inventory and pipeline trace.
 - `docs/streaming_audio_analysis.md` — yield levels (engine / scheduler / API) and sample-rate handling.
 
@@ -48,8 +49,10 @@ stats = tts.save_stream(request, "output.flac")
 
 Two-phase scheduler in `src/auralis/common/scheduling/two_phase_scheduler.py`:
 
-1. **`TTS._prepare_generation_context`** (`src/auralis/core/tts.py`) — invokes `XTTSv2.get_generation_context`, which tokenises the text, builds conditioning, and **eagerly calls `llm_engine.generate()` for every sentence**, collecting async generators into a list. (A lazy variant was attempted in `bfdda62` and reverted in `9e924d5`; eager submission paired with the structured cleanup pattern in §2 is the production code path.)
-2. **`TTS._second_phase_fn` → `XTTSv2.process_tokens_to_speech`** — iterates each generator; for every finished sentence it runs a **second** `llm_engine.generate(max_tokens=1)` via `get_model_logits` solely to collect hidden states (legacy V0 hack, see Known bugs #6), then decodes on a thread via `asyncio.to_thread(self.hifigan_decoder, ...)`.
+1. **`TTS._prepare_generation_context`** (`src/auralis/core/tts.py`) — invokes `XTTSv2.get_generation_context`, which tokenises the text, builds conditioning, and appends one **unstarted** `XTTSv2._make_sentence_generator(...)` per sentence into the `generators` list. The body of each lazy generator (`ExtendedSamplingParams` construction, `TokensPrompt`, the actual `llm_engine.generate()` call) executes only on the first `__anext__` — i.e. after the `TwoPhaseScheduler` acquires `second_phase_sem`. So at any moment only ~`second_phase_concurrency` sentences are registered with vLLM, not all `len(tokens_list)`.
+2. **`TTS._second_phase_fn` → `XTTSv2.process_tokens_to_speech`** — iterates each generator; for every finished sentence it runs a **second** `llm_engine.generate(max_tokens=1)` via `get_model_logits` solely to collect hidden states (legacy V0 hack, see Known bugs #6), then decodes on a thread via `asyncio.to_thread(self.hifigan_decoder, ...)`. Both `get_model_logits` and `process_tokens_to_speech` wrap the vLLM-owning body in `try`/`finally` and explicitly `abort` + `del` + `empty_cache` on exit — see §2.
+
+*History note*: the lazy generator landed in `bfdda62`, was reverted by `9e924d5` (which also added structured cleanup tied to eager submission), then `9e924d5` itself was reverted in `39770e3` so the lazy pipeline came back. `9b48910` re-applied the cleanup pattern on top of the lazy pipeline — they compose. Read both commits if you need the why.
 
 Streaming writers `save_stream` / `save_stream_async` in `src/auralis/core/tts.py` flush audio chunks straight to disk — RAM footprint is O(1) regardless of duration.
 
@@ -69,17 +72,18 @@ The empirical polynomial (`src/auralis/models/xttsv2/XTTSv2.py`) returns GB of m
 
 A proper fix would require recalibrating the polynomial (or deleting it and using a sensible default like `0.85`). That is not done here.
 
-### 2. `llm_engine.generate()` is eager — cleanup must be structured
+### 2. `llm_engine.generate()` registers eagerly — cleanup must be structured
 
-`AsyncLLMEngine.generate()` registers the request with vLLM's scheduler at call time; it is not a lazy iterator. The current loop in `XTTSv2.get_generation_context` submits every sentence in a sub-request up front, each pinning its `SequenceGroup`, multi-modal audio embeddings, and our `ExtendedSamplingParams`. A lazy `_make_sentence_generator` variant was tried in `bfdda62` and reverted in `9e924d5`; the production answer is **eager submission + disciplined per-request cleanup**.
+Even though `XTTSv2._make_sentence_generator` defers the actual call until the first `__anext__`, once that body runs `AsyncLLMEngine.generate()` registers the request with vLLM's scheduler immediately and pins a `SequenceGroup`, multi-modal audio embeddings, and our `ExtendedSamplingParams` until the request is explicitly aborted or evicted. A non-aborted finished request keeps its KV-cache slabs (~50 tensors / ~1.87 GiB per request on the 154-min book benchmark) alive until the next `add_request` evicts it — which on the *last* sub-request of a `save_stream()` never happens. See `kv_cache_leak_audit.md`.
 
-**Rule** (current shape of `process_tokens_to_speech` and `get_model_logits` after `9e924d5`):
+**Rule** (current shape of `process_tokens_to_speech` and `get_model_logits` after `9b48910`):
 
+- Pre-declare every local the `finally` will touch (e.g. `generator = output = sampling_params = bound_collector = hidden_states = None`) before `try` so the `finally` is always safe to run.
 - Wrap the body that owns vLLM-side state in `try` / `finally`.
-- In the `finally`: `await self.llm_engine.abort(request_id)`, set `sampling_params.hidden_state_collector = None` (for the logits-only path), `del` every local that holds GPU tensors / generators / outputs, and call `torch.cuda.empty_cache()`.
-- **Yield the `TTSOutput` *outside* `decoder_semaphore` and `cuda_memory_manager`** — build it inside the CUDA context, but `yield tts_output` only after the contexts exit and the `finally` block has aborted and freed locals. Yielding while still inside `cuda_memory_manager` lets the caller (and downstream `parallel_inputs` references) keep the per-sentence GPU state alive across `await` points.
+- In the `finally`: `await self.llm_engine.abort(request_id)` (best-effort, in `try`/`except` → `logger.debug`); set `sampling_params.hidden_state_collector = None` to break the `SyncCollectorWrapper` cycle vLLM keeps via finished `RequestOutput` history; reach into `self.llm_engine.engine.model_executor.driver_worker.model_runner.model.positional_embeddings_correcter` and call `clear_request(rid)` + `clear_request(f"{rid}_logits")` (best-effort, vLLM private path); `del` every local that pins GPU tensors / generators / outputs / dicts; call `torch.cuda.empty_cache()` last.
+- **Yield the `TTSOutput` *outside* `decoder_semaphore` and `cuda_memory_manager`** — build it inside the CUDA context, but `yield tts_output` only after both contexts exit and the `finally` block has aborted, cleared and freed locals. Yielding while still inside `cuda_memory_manager` defers `empty_cache` for the entire time the consumer holds the generator, defeating the manager.
 
-Any new code path that calls `llm_engine.generate()` must follow the same shape, or it will leak ~1 MB of vLLM metadata per sentence (~900 MB on 154-minute jobs).
+Any new code path that calls `llm_engine.generate()` must follow this shape.
 
 ### 3. `HiddenStatesCollector` is shared per engine
 
@@ -124,11 +128,17 @@ Do not introduce `self.loop.run_until_complete(...)` inside it — the coroutine
 
 Documented in `docs/vllm_engine_lifecycle_audit.md`. Calling `TTS.from_pretrained()` twice on the same `TTS` instance overwrites `self.tts_engine` without shutting down the previous engine — the old `AsyncLLMEngine` (and its KV-cache reservation) stays alive on the GPU. Only matters if user code reloads models on the same instance, but it is a real footgun and the audit recommends a `if self.tts_engine is not None: self.loop.run_until_complete(self.tts_engine.shutdown())` guard. Patch is suggested in the audit but **not yet applied** — see Outstanding work.
 
+### 10. `cuda_memory_manager` adds 100 ms per chunk
+
+`XTTSv2.cuda_memory_manager` (`src/auralis/models/xttsv2/XTTSv2.py:498-509`) does `torch.cuda.synchronize()` → `await asyncio.sleep(0.1)` → `torch.cuda.empty_cache()` in its `finally`. Origin of the 100 ms is undocumented (likely a workaround for a race in PyTorch's CUDA caching allocator). On a 900-sentence book that is ~90 s of wall-clock spent sleeping. A future commit should remove the `sleep` under measurement and confirm RTF improves without re-introducing the original race.
+
 ---
 
 ## Editing playbook
 
-- **Before changing `XTTSv2.process_tokens_to_speech` or `get_model_logits`**: re-read §2. Cleanup must be in `finally`; `yield` must be outside `decoder_semaphore` / `cuda_memory_manager`; `abort` + `del` + `empty_cache` must run before yielding.
+- **Before changing `XTTSv2.process_tokens_to_speech` or `get_model_logits`**: re-read §2. Cleanup must be in `finally`; locals must be pre-declared; `yield` must be outside `decoder_semaphore` / `cuda_memory_manager`; `abort` + `clear_request` + `del` + `empty_cache` must run before yielding.
+- **Before changing `XTTSv2._make_sentence_generator`**: it is intentionally laziness-only and contains no cleanup — cleanup happens in `process_tokens_to_speech.finally`. If you add work here, do not introduce per-sentence eager allocations.
+- **Before changing `vllm_mm_gpt.py:678` (compute_logits hijack guard)**: the guard `if hidden_state_collector is not None` is load-bearing. `compute_logits` runs on every decode step; unconditionally calling `clear_request` here will empty `request_tracker_dict` mid-generation and break `get_by_next_token` on token #2. The audio-token path's `clear_request` is done from `process_tokens_to_speech.finally` via the private vLLM path (§2), not from inside the hijack.
 - **Before changing `hidden_state_collector.py`**: run `python -m pytest tests/unit/test_hidden_states_collector_leak.py -v`. Every early-return path in `get_hidden_states` must call `_cleanup_request`. Stored tensors must be `detach().clone()`, not bare `.clone()`.
 - **Before adding new `asyncio.to_thread` sites**: confirm they run on `self.loop` so `TTS.shutdown` cleans them up.
 - **Before touching the progress bar**: do not put a numeric denominator on it unless you also count audio chunks, not input slices.
@@ -139,7 +149,8 @@ Documented in `docs/vllm_engine_lifecycle_audit.md`. Calling `TTS.from_pretraine
 ## Outstanding work (low-confidence backlog)
 
 - **Engine shutdown in `TTS.from_pretrained`.** The patch in `docs/vllm_engine_lifecycle_audit.md` (§6) is small and concrete: shut down `self.tts_engine` if non-`None` before reloading. Not yet applied.
-- **Lazy generator pipeline (revisit).** Attempted in `bfdda62`, reverted in `9e924d5` in favour of eager submission + structured cleanup. If `gpt_embed_inputs` floor (~135 MiB on 900-sentence jobs) becomes the dominant remaining growth, revisiting laziness — or better, streaming `gpt_embed_inputs` itself — is the next lever.
+- **Streaming `gpt_embed_inputs`.** With §2 cleanup applied (`9b48910`), KV-cache and per-request metadata are no longer the dominant growth. The remaining floor is the per-sentence `gpt_embed_inputs` list built eagerly in `XTTSv2._merge_conditioning` (~135 MiB on 900-sentence jobs). Streaming this through `prepare_inputs_async` rather than materialising it once per sub-request is the next lever, but it is invasive (changes the `_make_sentence_generator` signature).
+- **Drop `cuda_memory_manager`'s `asyncio.sleep(0.1)`.** See §10. ~90 s wall-clock saved per 900-sentence job if the sleep is not protecting a real race; verify under measurement before removing.
 - **Polynomial replacement.** Either delete `get_memory_usage_curve` and default `gpu_memory_utilization` to 0.85, or recalibrate with real measurements across GPUs. The current polynomial is actively misleading.
 - **V1 engine migration.** `docs/VLLM_COMPATIBILITY_AUDIT.md` enumerates the blocking issues. Until that lands, we are stuck on `vllm==0.6.4.post1`.
 
