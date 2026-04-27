@@ -132,6 +132,10 @@ Applied. `TTS.from_pretrained` now checks `self.tts_engine is not None and hasat
 
 `XTTSv2.cuda_memory_manager` (`src/auralis/models/xttsv2/XTTSv2.py:498-509`) does `torch.cuda.synchronize()` → `await asyncio.sleep(0.1)` → `torch.cuda.empty_cache()` in its `finally`. Origin of the 100 ms is undocumented (likely a workaround for a race in PyTorch's CUDA caching allocator). On a 900-sentence book that is ~90 s of wall-clock spent sleeping. A future commit should remove the `sleep` under measurement and confirm RTF improves without re-introducing the original race.
 
+### 11. Conditioning encoder must not build autograd graphs
+
+The conditioning encoder path (`get_style_emb`, `get_gpt_cond_latents`, `_get_speaker_embedding`) must run inside `torch.no_grad()`; outputs must be `.detach()`-ed before passing to vLLM. Resolved in commit `7d6299490b53aa30ff18c37a68cabe5c9ff8e2f3`.
+
 ---
 
 ## Editing playbook
