@@ -98,6 +98,23 @@ class TTS:
         async def _load_model():
             return MODEL_REGISTRY[config['model_type']].from_pretrained(model_name_or_path, **kwargs)
 
+        # If a previous engine is still attached to this TTS instance, shut it
+        # down before overwriting self.tts_engine. Otherwise a second
+        # from_pretrained() call on the same instance silently leaks the prior
+        # AsyncLLMEngine and its KV-cache reservation on the GPU. We only do
+        # this after the new config has loaded successfully so that a bad
+        # model_name_or_path does not destroy a working engine.
+        # See docs/vllm_engine_lifecycle_audit.md §6.
+        if self.tts_engine is not None and hasattr(self.tts_engine, 'shutdown'):
+            try:
+                self.loop.run_until_complete(self.tts_engine.shutdown())
+            except Exception as e:
+                self.logger.warning(
+                    f"Previous tts_engine.shutdown() raised: {e}. Continuing with reload; "
+                    f"GPU memory from the previous engine may not be fully released."
+                )
+            self.tts_engine = None
+
         self.tts_engine = self.loop.run_until_complete(_load_model()) # to start form the correct loop
 
         return self

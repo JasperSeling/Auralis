@@ -124,9 +124,9 @@ The rich progress setup in `tts.py` uses `MofNCompleteColumn` with **`total=None
 
 Do not introduce `self.loop.run_until_complete(...)` inside it — the coroutine is already scheduled on `self.loop`.
 
-### 9. `TTS.from_pretrained()` can leak the previous vLLM engine
+### 9. `TTS.from_pretrained()` shuts down the previous vLLM engine
 
-Documented in `docs/vllm_engine_lifecycle_audit.md`. Calling `TTS.from_pretrained()` twice on the same `TTS` instance overwrites `self.tts_engine` without shutting down the previous engine — the old `AsyncLLMEngine` (and its KV-cache reservation) stays alive on the GPU. Only matters if user code reloads models on the same instance, but it is a real footgun and the audit recommends a `if self.tts_engine is not None: self.loop.run_until_complete(self.tts_engine.shutdown())` guard. Patch is suggested in the audit but **not yet applied** — see Outstanding work.
+Applied. `TTS.from_pretrained` now checks `self.tts_engine is not None and hasattr(...,'shutdown')` and runs the previous engine's async `shutdown()` on `self.loop` before overwriting `self.tts_engine`. The check sits *after* the new config has been parsed successfully, so a bad `model_name_or_path` does not destroy the currently working engine. Failures from the prior shutdown are logged at WARNING and do not abort the reload. See `docs/vllm_engine_lifecycle_audit.md §6` for the original audit.
 
 ### 10. `cuda_memory_manager` adds 100 ms per chunk
 
@@ -148,7 +148,6 @@ Documented in `docs/vllm_engine_lifecycle_audit.md`. Calling `TTS.from_pretraine
 
 ## Outstanding work (low-confidence backlog)
 
-- **Engine shutdown in `TTS.from_pretrained`.** The patch in `docs/vllm_engine_lifecycle_audit.md` (§6) is small and concrete: shut down `self.tts_engine` if non-`None` before reloading. Not yet applied.
 - **Streaming `gpt_embed_inputs`.** With §2 cleanup applied (`9b48910`), KV-cache and per-request metadata are no longer the dominant growth. The remaining floor is the per-sentence `gpt_embed_inputs` list built eagerly in `XTTSv2._merge_conditioning` (~135 MiB on 900-sentence jobs). Streaming this through `prepare_inputs_async` rather than materialising it once per sub-request is the next lever, but it is invasive (changes the `_make_sentence_generator` signature).
 - **Drop `cuda_memory_manager`'s `asyncio.sleep(0.1)`.** See §10. ~90 s wall-clock saved per 900-sentence job if the sleep is not protecting a real race; verify under measurement before removing.
 - **Polynomial replacement.** Either delete `get_memory_usage_curve` and default `gpu_memory_utilization` to 0.85, or recalibrate with real measurements across GPUs. The current polynomial is actively misleading.
