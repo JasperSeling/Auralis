@@ -64,7 +64,10 @@ setup(
         "transformers>=4.44.2,<4.45.0",
         "vllm==0.6.4.post1",
         "nvidia-ml-py",
-        "numpy<2.0",
+        # scipy>=1.14 requires numpy>=2.0 (ABI break)
+        # numpy>=2.0 breaks vLLM 0.6.4 and pyloudnorm binary extensions
+        "numpy>=1.26.0,<2.0",
+        "scipy<1.14",
         "langid"
 
     ],
