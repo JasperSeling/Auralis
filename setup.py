@@ -40,7 +40,7 @@ setup(
         "einops",
         "ffmpeg",
         "fsspec",
-        "hangul-romanize",
+        "hangul_romanize",
         "huggingface_hub",
         "ipython",
         "librosa",
@@ -53,27 +53,21 @@ setup(
         "pypinyin",
         "rich",
         "safetensors",
+        "sounddevice",
         "soundfile",
         "spacy>=3.8.0",
         "setuptools",
         "safetensors",
+        "torchaudio",
         "tokenizers",
-        # transformers 4.45+ breaks XTTSTokenizerFast compatibility with vLLM 0.6.4
-        # all_special_tokens_extended property missing in custom tokenizer
-        "transformers>=4.44.2,<4.45.0",
+        "transformers",
         "vllm==0.6.4.post1",
         "nvidia-ml-py",
-        # scipy>=1.14 requires numpy>=2.0 (ABI break)
-        # numpy>=2.0 breaks vLLM 0.6.4 and pyloudnorm binary extensions
-        "numpy>=1.26.0,<2.0",
-        "scipy<1.14",
+        "numpy",
         "langid"
 
     ],
     extras_require={
-        'audio': [
-            'sounddevice',
-        ],
         'docs': [
             'mkdocs>=1.4.0',
             'mkdocs-material>=9.0.0',
